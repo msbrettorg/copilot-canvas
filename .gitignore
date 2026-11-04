@@ -1,0 +1,11 @@
+artifacts/
+dist/
+node_modules/
+*.log
+.DS_Store
+
+apps/*/artifacts/
+apps/*/.env
+apps/*/.env.*
+
+**/.impeccable/
