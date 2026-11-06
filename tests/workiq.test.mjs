@@ -16,7 +16,15 @@ import {
   emailRecipientRole,
   extractEmailBlocks,
   extractRichEmailContent,
+  fetchEmailDetail,
   formatRecurrence,
+  graphDateTimeToUtcIso,
+  isDeletedOrSystemMessage,
+  isOutlookOwaDeepLink,
+  readEmailWindow,
+  readEmailWindowSlice,
+  sanitizeOutlookDeepLink,
+  syncTeamsChatsWindow,
   isCanceledInvite,
   normalizeGraphDateTime,
   normalizeResponseLabel,
@@ -32,10 +40,19 @@ import {
 } from "../apps/triage-inbox/lib.mjs";
 import {
   WORKIQ_REQUIRED_TOOLS,
+  WORKIQ_TOOL_NAMES,
   WorkIqError,
+  WorkIqToolError,
+  classifyWorkIqPath,
   createWorkIqDirectClient,
   createWorkIqHostAdapter,
+  extractWorkIqAnswer,
+  extractWorkIqEntityOutcomes,
+  extractWorkIqEntityResults,
+  extractWorkIqPayload,
+  normalizeWorkIqToolName,
   unwrapWorkIqResult,
+  validateWorkIqToolSurface,
 } from "../apps/triage-inbox/workiq.mjs";
 import { SEED_EVENTS, SEED_ITEMS, buildSeedEvents } from "../apps/triage-inbox/seed.mjs";
 import { selectApps } from "../scripts/common.mjs";
@@ -882,9 +899,6 @@ test("detail endpoints return Teams, email, and calendar structures", async (t) 
           ],
         };
       }
-      if (path.endsWith("/members")) {
-        return { results: [{ statusCode: 200, data: { value: [{ id: "member-1", displayName: "Sample User" }] } }] };
-      }
       if (path.includes("/email-1?")) {
         return {
           results: [
@@ -977,7 +991,8 @@ test("detail endpoints return Teams, email, and calendar structures", async (t) 
   assert.equal(teams.messages.length, 2);
   assert.equal(teams.messages[0].body, "Earlier message");
   assert.equal(teams.messages[1].body, "Attachment title");
-  assert.equal(teams.members[0].name, "Sample User");
+  assert.deepEqual(teams.members.map((member) => member.name).sort(), ["Alex Morgan", "Other User"]);
+  assert.equal(calls.some(([path]) => path.endsWith("/members")), false, "participants come from message senders");
 
   const email = await triage.getDetail(bySource.email.id);
   assert.equal(email.attachments.length, 0);
@@ -2195,7 +2210,7 @@ test("Teams detail refreshes the queue row from the latest live message", async 
   ]);
   const detail = await triage.getDetail(state.items[0].id);
   assert.equal(detail.messages.at(-1).replyTo[0].sender, "Max");
-  assert.deepEqual(paths, ["/chats/chat-sync/messages?$top=20"]);
+  assert.deepEqual(paths, ["/chats/chat-sync/messages?$top=50&$orderby=createdDateTime%20desc"]);
   assert.deepEqual(detail.members.map((member) => member.name), ["Jordan Rivera", "Taylor Kim"]);
   const [row] = (await triage.getItems()).items;
   assert.equal(row.sender, "Jordan Rivera");
@@ -2341,36 +2356,59 @@ function unreadChat(id, overrides = {}) {
   };
 }
 
-test("fetchChats follows @odata.nextLink across pages without sending $skip", async (t) => {
+const emptyInbox = { results: [{ statusCode: 200, data: { value: [] } }] };
+
+function chatMessage(id, createdDateTime, body, extra = {}) {
+  return {
+    id,
+    messageType: "message",
+    createdDateTime,
+    from: { user: { id: `user-${id}`, displayName: `Sample User ${id}` } },
+    body: { contentType: "text", content: body },
+    ...extra,
+  };
+}
+
+test("fetchChats reads one /me/chats page, batches encoded message reads, and persists the thread", async (t) => {
   const stateRoot = await mkdtemp(join(tmpdir(), "triage-workiq-"));
   t.after(() => rm(stateRoot, { recursive: true, force: true }));
   const chatPaths = [];
+  const messageCalls = [];
+  const chatId = "chat/id:one+two";
   const workiq = {
     fetch: async (urls) => {
       const path = urls[0];
-      if (path.startsWith("/me/mailFolders/inbox/messages")) {
-        return { results: [{ statusCode: 200, data: { value: [] } }] };
-      }
+      if (path.startsWith("/me/mailFolders/inbox/messages")) return emptyInbox;
       if (path.startsWith("/me?")) return { results: [{ statusCode: 404, error: "unavailable" }] };
       chatPaths.push(path);
-      if (path.includes("$skiptoken=page2")) {
-        return {
-          results: [
-            { statusCode: 200, data: { value: [unreadChat("c49"), unreadChat("c50"), unreadChat("c0")] } },
-          ],
-        };
-      }
-      const value = Array.from({ length: 49 }, (_, index) => unreadChat(`c${index}`));
       return {
-        results: [
-          {
-            statusCode: 200,
-            data: {
-              value,
-              "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/chats?$top=50&$skiptoken=page2",
-            },
+        results: [{
+          statusCode: 200,
+          data: {
+            value: [unreadChat(chatId)],
+            "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/chats?$top=50&$skiptoken=page2",
           },
-        ],
+        }],
+      };
+    },
+    fetchPartial: async (urls, options) => {
+      messageCalls.push({ urls, options });
+      return {
+        results: urls.map(() => ({
+          statusCode: 200,
+          data: {
+            value: [
+              chatMessage("m3", "2026-01-15T17:00:00Z", "Newest question?"),
+              chatMessage("sys", "2026-01-15T16:59:00Z", "", {
+                messageType: "systemEventMessage",
+                eventDetail: { "@odata.type": "#microsoft.graph.membersAddedEventMessageDetail" },
+              }),
+              chatMessage("m2", "2026-01-15T16:30:00Z", "Middle", { eventDetail: null, "@removed": null }),
+              chatMessage("gone", "2026-01-15T16:20:00Z", "Deleted", { deletedDateTime: "2026-01-15T16:25:00Z" }),
+              chatMessage("m1", "2026-01-15T16:10:00Z", "Oldest"),
+            ],
+          },
+        })),
       };
     },
     update: async () => ({}),
@@ -2379,42 +2417,54 @@ test("fetchChats follows @odata.nextLink across pages without sending $skip", as
   const triage = createTriage({ workiq, statePath: join(stateRoot, "state.json") });
   const result = await triage.refresh();
   assert.deepEqual(result.errors, []);
-  assert.equal(chatPaths.length, 2);
-  assert.ok(chatPaths.every((path) => !path.includes("$skip=")));
-  assert.equal(chatPaths[1], "/me/chats?$top=50&$skiptoken=page2");
-  assert.equal(result.items.filter((item) => item.source === "teams").length, 51);
+  assert.equal(chatPaths.length, 1, "/me/chats is read as exactly one page");
+  assert.equal(
+    chatPaths[0],
+    "/me/chats?$select=id,chatType,topic,tenantId,lastUpdatedDateTime,viewpoint,webUrl&$expand=lastMessagePreview&$top=50",
+  );
+  assert.equal(messageCalls.length, 1);
+  assert.deepEqual(messageCalls[0].urls, [
+    "/chats/chat%2Fid%3Aone%2Btwo/messages?$top=50&$orderby=createdDateTime%20desc",
+  ]);
+  assert.deepEqual(messageCalls[0].options, { tolerateEntityErrors: true });
+
+  const [item] = result.items.filter((entry) => entry.source === "teams");
+  assert.deepEqual(item.messages.map((message) => message.id), ["m1", "m2", "m3"]);
+  assert.equal(item.members.length, 3);
+
+  const before = messageCalls.length;
+  let detailCalls = 0;
+  const original = workiq.fetch;
+  workiq.fetch = async (...args) => {
+    detailCalls++;
+    return original(...args);
+  };
+  const detail = await triage.getDetail(item.id);
+  assert.equal(detail.messages.length, 3);
+  assert.equal(detailCalls, 0);
+  assert.equal(messageCalls.length, before);
 });
 
-test("fetchChats retries one transient continuation page failure before truncating", async (t) => {
+test("fetchChats batches message reads by 20 and keeps successful entities when others fail", async (t) => {
   const stateRoot = await mkdtemp(join(tmpdir(), "triage-workiq-"));
   t.after(() => rm(stateRoot, { recursive: true, force: true }));
-  let pageTwoAttempts = 0;
-  const chatPaths = [];
+  const batches = [];
   const workiq = {
     fetch: async (urls) => {
       const path = urls[0];
-      if (path.startsWith("/me/mailFolders/inbox/messages")) {
-        return { results: [{ statusCode: 200, data: { value: [] } }] };
-      }
+      if (path.startsWith("/me/mailFolders/inbox/messages")) return emptyInbox;
       if (path.startsWith("/me?")) return { results: [{ statusCode: 404, error: "unavailable" }] };
-      chatPaths.push(path);
-      if (path.includes("$skiptoken=page2")) {
-        pageTwoAttempts++;
-        if (pageTwoAttempts === 1) {
-          throw new WorkIqError("workiq_timeout", "WorkIQ request timed out");
-        }
-        return {
-          results: [{ statusCode: 200, data: { value: [unreadChat("page-2")] } }],
-        };
-      }
       return {
-        results: [{
-          statusCode: 200,
-          data: {
-            value: [unreadChat("page-1")],
-            "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/chats?$skiptoken=page2",
-          },
-        }],
+        results: [{ statusCode: 200, data: { value: Array.from({ length: 45 }, (_, index) => unreadChat(`chat-${index}`)) } }],
+      };
+    },
+    fetchPartial: async (urls) => {
+      batches.push(urls.length);
+      return {
+        results: urls.map((path, index) =>
+          index % 2 === 0
+            ? { statusCode: 429, error: { error: { code: "TooManyRequests" } }, retryAfterSeconds: 2 }
+            : { statusCode: 200, data: { value: [chatMessage(`m-${path}`, "2026-01-15T17:00:00Z", "Live message")] } }),
       };
     },
     update: async () => ({}),
@@ -2422,9 +2472,43 @@ test("fetchChats retries one transient continuation page failure before truncati
   };
   const triage = createTriage({ workiq, statePath: join(stateRoot, "state.json") });
   const result = await triage.refresh();
-  assert.equal(pageTwoAttempts, 2);
-  assert.deepEqual(chatPaths.map((path) => path.includes("$skiptoken=page2")), [false, true, true]);
-  assert.equal(result.items.filter((item) => item.source === "teams").length, 2);
+  assert.deepEqual(batches, [20, 20, 5]);
+  const teams = result.items.filter((item) => item.source === "teams");
+  assert.equal(teams.length, 45);
+  assert.ok(teams.every((item) => item.messages.length >= 1), "item.messages is never empty when a summary exists");
+  assert.ok(teams.some((item) => item.messages[0].body === "Live message"));
+  assert.ok(teams.some((item) => item.messages[0].body === item.summary));
+});
+
+test("fetchChats reuses the stored thread when a message batch fails", async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "triage-workiq-"));
+  t.after(() => rm(stateRoot, { recursive: true, force: true }));
+  let fail = false;
+  const workiq = {
+    fetch: async (urls) => {
+      const path = urls[0];
+      if (path.startsWith("/me/mailFolders/inbox/messages")) return emptyInbox;
+      if (path.startsWith("/me?")) return { results: [{ statusCode: 404, error: "unavailable" }] };
+      return { results: [{ statusCode: 200, data: { value: [unreadChat("chat-keep")] } }] };
+    },
+    fetchPartial: async (urls) => {
+      if (fail) return { results: urls.map(() => ({ statusCode: 500, error: { message: "boom" } })) };
+      return {
+        results: urls.map(() => ({
+          statusCode: 200,
+          data: { value: [chatMessage("m-live", "2026-01-15T17:00:00Z", "Message chat-keep")] },
+        })),
+      };
+    },
+    update: async () => ({}),
+    action: async () => ({}),
+  };
+  const triage = createTriage({ workiq, statePath: join(stateRoot, "state.json") });
+  await triage.refresh();
+  fail = true;
+  const result = await triage.refresh();
+  const [item] = result.items.filter((entry) => entry.source === "teams");
+  assert.deepEqual(item.messages.map((message) => message.id), ["m-live"]);
 });
 
 test("fetchChats keeps unread chats when preview lookup fails", async (t) => {
@@ -2453,84 +2537,71 @@ test("fetchChats keeps unread chats when preview lookup fails", async (t) => {
   assert.ok(result.items.every((item) => item.summary === "Unread message in Teams"));
 });
 
-test("fetchChats limits preview enrichment to six chats and six messages each", async (t) => {
-  const stateRoot = await mkdtemp(join(tmpdir(), "triage-workiq-"));
-  t.after(() => rm(stateRoot, { recursive: true, force: true }));
-  const blank = (id) =>
-    unreadChat(id, { lastMessagePreview: { body: { content: "" }, from: null, createdDateTime: "2026-01-15T17:00:00Z" } });
-  const previewPaths = [];
-  const workiq = {
-    fetch: async (urls) => {
-      const path = urls[0];
-      if (path.startsWith("/me/mailFolders/inbox/messages")) {
-        return { results: [{ statusCode: 200, data: { value: [] } }] };
-      }
-      return {
-        results: [{
-          statusCode: 200,
-          data: { value: Array.from({ length: 8 }, (_, index) => blank(`chat-${index}`)) },
-        }],
-      };
-    },
-    fetchPartial: async (urls) => {
-      previewPaths.push(...urls);
-      return {
-        results: urls.map((path) => ({
-          statusCode: 200,
-          data: { value: [] },
-        })),
-      };
-    },
-    update: async () => ({}),
-    action: async () => ({}),
-  };
-  const triage = createTriage({ workiq, statePath: join(stateRoot, "state.json") });
-  await triage.refresh();
-  assert.equal(previewPaths.length, 6);
-  assert.ok(previewPaths.every((path) => path.endsWith("/messages?$top=6")));
-  assert.ok(previewPaths.every((path) => !path.includes("$orderby")));
+test("Teams detail falls back to the item summary without a warning when WorkIQ returns 429 or 500", async (t) => {
+  for (const failure of [
+    { statusCode: 429, error: { error: { code: "TooManyRequests", message: "Too many requests." } }, retryAfterSeconds: 62 },
+    { statusCode: 500, error: { message: "Internal error" } },
+  ]) {
+    const stateRoot = await mkdtemp(join(tmpdir(), "triage-fallback-"));
+    t.after(() => rm(stateRoot, { recursive: true, force: true }));
+    const workiq = {
+      fetch: async () => ({ results: [failure] }),
+      fetchPartial: async () => ({ results: [failure] }),
+      update: async () => ({}),
+      action: async () => ({}),
+    };
+    const triage = createTriage({ workiq, statePath: join(stateRoot, "state.json") });
+    const state = await triage.setItems([
+      {
+        source: "teams",
+        chatId: "chat-legacy",
+        title: "Older state",
+        sender: "Taylor Kim",
+        summary: "Can you review the plan?",
+        receivedAt: "2026-01-15T17:00:00Z",
+        status: "action",
+      },
+    ]);
+    const detail = await triage.getDetail(state.items[0].id);
+    assert.equal(detail.cached, null);
+    assert.equal(detail.warning, null);
+    assert.equal(detail.messages.length, 1);
+    assert.equal(detail.messages[0].body, "Can you review the plan?");
+    assert.equal(detail.messages[0].from, "Taylor Kim");
+    assert.equal(state.items[0].messages, undefined, "a synthesized fallback is not persisted");
+  }
 });
 
-test("fetchChats skips preview enrichment after multiple chat pages and caps at eight pages", async (t) => {
-  const stateRoot = await mkdtemp(join(tmpdir(), "triage-workiq-"));
+test("Teams detail stores the fetched thread so a second click makes no WorkIQ call", async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "triage-store-"));
   t.after(() => rm(stateRoot, { recursive: true, force: true }));
-  const blank = (id) =>
-    unreadChat(id, { lastMessagePreview: { body: { content: "" }, from: null, createdDateTime: "2026-01-15T17:00:00Z" } });
-  const chatPages = [];
-  let previewCalls = 0;
+  let calls = 0;
   const workiq = {
-    fetch: async (urls) => {
-      const path = urls[0];
-      if (path.startsWith("/me/mailFolders/inbox/messages")) {
-        return { results: [{ statusCode: 200, data: { value: [] } }] };
-      }
-      if (path.startsWith("/me?")) return { results: [{ statusCode: 404, error: "unavailable" }] };
-      chatPages.push(path);
-      const page = chatPages.length;
+    fetch: async () => ({ results: [] }),
+    fetchPartial: async () => {
+      calls++;
       return {
         results: [{
           statusCode: 200,
-          data: {
-            value: page === 1
-              ? Array.from({ length: 49 }, (_, index) => blank(`chat-${index}`))
-              : [blank(`chat-${page + 47}`)],
-            "@odata.nextLink": `https://graph.microsoft.com/v1.0/me/chats?$skiptoken=page${page + 1}`,
-          },
+          data: { value: [chatMessage("a", "2026-01-15T17:00:00Z", "Stored once")] },
         }],
       };
-    },
-    fetchPartial: async () => {
-      previewCalls++;
-      return { results: [] };
     },
     update: async () => ({}),
     action: async () => ({}),
   };
   const triage = createTriage({ workiq, statePath: join(stateRoot, "state.json") });
-  const result = await triage.refresh();
-  assert.equal(chatPages.length, 8);
-  assert.equal(previewCalls, 0);
-  assert.equal(result.items.filter((item) => item.source === "teams").length, 56);
+  const state = await triage.setItems([
+    { source: "teams", chatId: "chat-store", title: "Legacy", summary: "Old", status: "fyi" },
+  ]);
+  const first = await triage.getDetail(state.items[0].id);
+  assert.equal(first.messages[0].body, "Stored once");
+  const forced = await triage.getDetail(state.items[0].id, { forceRefresh: true });
+  assert.equal(forced.messages[0].body, "Stored once");
+  assert.equal(calls, 2);
+  const second = await triage.getDetail(state.items[0].id);
+  assert.equal(second.messages[0].body, "Stored once");
+  assert.equal(calls, 2, "only forceRefresh reads WorkIQ again");
 });
 
 test("classifyChat keeps every unread chat: Engineering Champs and own messages become fyi", () => {
@@ -3471,4 +3542,339 @@ test("calendarDetail reuses the loaded agenda for the next seven days and refres
   await assert.rejects(triage.refreshAgenda());
   const cachedDay = await triage.getDetail(item.id);
   assert.equal(cachedDay.meeting.schedule.coverage, "cached");
+});
+
+const entityEnvelope = (...results) => ({ results });
+
+test("unwrapWorkIqResult tolerates an isError entity envelope only when validation is off", () => {
+  const result = {
+    isError: true,
+    structuredContent: entityEnvelope(
+      { statusCode: 200, data: { id: "ok" } },
+      { statusCode: 500, error: { message: "boom" } },
+    ),
+  };
+  const payload = unwrapWorkIqResult(result, "fetch", { validateResults: false });
+  assert.equal(payload.results.length, 2);
+  assert.equal(unwrapWorkIqResult(result, "fetch", { tolerateEntityErrors: true }).results[0].data.id, "ok");
+  assert.throws(() => unwrapWorkIqResult(result, "fetch"), { code: "workiq_error" });
+  assert.throws(
+    () => unwrapWorkIqResult({ isError: true, structuredContent: { message: "no envelope" } }, "fetch", { validateResults: false }),
+    { code: "workiq_error" },
+  );
+});
+
+test("rawCallTool returns the raw MCP result so the bridge never unwraps or double-prefixes errors", async (t) => {
+  const statePath = await stateFile(t);
+  const bridgePath = join(statePath, "..", "bridge.json");
+  const failure = {
+    isError: true,
+    structuredContent: entityEnvelope({ statusCode: 400, error: { message: "bad request" } }),
+  };
+  let primaryCalls = 0;
+  let failing = false;
+  const primary = createWorkIqHostAdapter({
+    listTools: async () => toolList(),
+    callTool: async () => {
+      primaryCalls++;
+      return failing ? failure : okFetch;
+    },
+  });
+  const server = await createTriage({ workiq: primary, statePath }).startServer();
+  t.after(() => server.close());
+  await primary.fetch(["/me?$select=id"]);
+  failing = true;
+  const raw = await primary.rawCallTool({ toolName: "fetch", arguments: { entityUrls: ["/me"] } });
+  assert.deepEqual(raw, failure);
+  for (let i = 0; i < 20; i++) {
+    try {
+      await readFile(bridgePath, "utf8");
+      break;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    }
+  }
+  const bridge = JSON.parse(await readFile(bridgePath, "utf8"));
+  const response = await fetch(`${bridge.url}api/workiq-bridge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Triage-Bridge": bridge.token },
+    body: JSON.stringify({ method: "callTool", params: { toolName: "fetch", arguments: { entityUrls: ["/me"] } } }),
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual((await response.json()).result, failure);
+
+  const standalone = createWorkIqHostAdapter({
+    bridgePath,
+    listTools: async () => toolList(),
+    callTool: async () => {
+      throw new Error("MCP host is not available on this session");
+    },
+  });
+  primaryCalls = 0;
+  await assert.rejects(standalone.fetch(["/me"]), (error) => {
+    assert.match(error.message, /^fetch \(\/me\): /);
+    assert.equal((error.message.match(/fetch \(/g) ?? []).length, 1, error.message);
+    return true;
+  });
+  assert.equal(primaryCalls, 1, "a permanent failure is not retried across the bridge");
+  const partial = await standalone.fetchPartial(["/me"]);
+  assert.equal(partial.results[0].statusCode, 400);
+});
+
+test("a long 429 retry-after sets a cooldown, never loops, and fails later calls fast", async () => {
+  let callCount = 0;
+  const throttled = {
+    isError: true,
+    structuredContent: entityEnvelope({
+      statusCode: 429,
+      error: { error: { code: "TooManyRequests", message: "Too many requests." } },
+      retryAfterSeconds: 62,
+    }),
+  };
+  const workiq = createWorkIqHostAdapter({
+    rateLimitDelayMs: 5,
+    listTools: async () => toolList(),
+    callTool: async () => {
+      callCount++;
+      return throttled;
+    },
+  });
+  const startedAt = Date.now();
+  await assert.rejects(workiq.fetch(["/me/chats"]), (error) => error.rateLimited === true && error.retryAfterSeconds === 62);
+  assert.equal(callCount, 1);
+  await assert.rejects(workiq.fetch(["/me/messages"]), (error) => {
+    assert.equal(error.code, "workiq_rate_limited");
+    assert.equal(error.rateLimited, true);
+    assert.ok(error.retryAfterSeconds > 55 && error.retryAfterSeconds <= 62);
+    return true;
+  });
+  await assert.rejects(workiq.action("/me/messages/x/move", {}), { code: "workiq_rate_limited" });
+  assert.equal(callCount, 1, "calls during the cooldown never reach WorkIQ");
+  assert.ok(Date.now() - startedAt < 1000);
+});
+
+test("fetchPartial returns a batch with a throttled entity without retrying and still cools down", async () => {
+  let callCount = 0;
+  const workiq = createWorkIqHostAdapter({
+    listTools: async () => toolList(),
+    callTool: async () => {
+      callCount++;
+      return {
+        isError: true,
+        structuredContent: entityEnvelope(
+          { statusCode: 200, data: { value: [] } },
+          { statusCode: 429, error: { message: "Too many requests." }, retryAfterSeconds: 62 },
+          { statusCode: 500, error: { message: "boom" } },
+        ),
+      };
+    },
+  });
+  const payload = await workiq.fetchPartial(["/a", "/b", "/c"], { tolerateEntityErrors: true });
+  assert.deepEqual(extractWorkIqEntityOutcomes(payload).map((outcome) => outcome.statusCode), [200, 429, 500]);
+  assert.equal(callCount, 1);
+  await assert.rejects(workiq.fetch(["/me"]), { code: "workiq_rate_limited" });
+  assert.equal(callCount, 1);
+});
+
+test("Frontier SE WorkIQ client helpers are ported", () => {
+  assert.equal(WORKIQ_TOOL_NAMES.length, 12);
+  assert.equal(normalizeWorkIqToolName("mcp__workiq__fetch"), "fetch");
+  assert.equal(normalizeWorkIqToolName("unknown"), null);
+  assert.equal(classifyWorkIqPath("/me/messages/abc"), "mail");
+  assert.equal(classifyWorkIqPath("/me/calendarView?x=1"), "calendar");
+  assert.equal(classifyWorkIqPath("/chats/1/messages"), "teams");
+  assert.equal(classifyWorkIqPath("/nope"), null);
+  assert.deepEqual(extractWorkIqPayload({ content: [{ text: '{"a":1}' }] }), { a: 1 });
+  assert.equal(extractWorkIqAnswer({ structuredContent: { answer: "Hi" } }), "Hi");
+  const surface = validateWorkIqToolSurface(WORKIQ_TOOL_NAMES.slice(1).map((name) => ({ name })).concat({ name: "extra" }));
+  assert.deepEqual(surface.missing, ["ask"]);
+  assert.deepEqual(surface.unknown, ["extra"]);
+  assert.equal(surface.satisfied, false);
+  assert.equal(extractWorkIqEntityResults(entityEnvelope({ statusCode: 200, data: { a: 1 } }, { statusCode: 500 })).length, 1);
+  assert.ok(new WorkIqToolError("x", true, 500, "r") instanceof WorkIqError);
+});
+
+test("readEmailWindowSlice halves an oversized window and never sends $skip", async () => {
+  const paths = [];
+  const day = (n) => `2026-11-0${n}T00:00:00.000Z`;
+  const workiq = {
+    fetch: async ([path]) => {
+      paths.push(path);
+      const filter = decodeURIComponent(path.match(/\$filter=([^&]+)/)[1]);
+      const [, start, end] = filter.match(/ge (\S+) and receivedDateTime lt (\S+)/);
+      const span = Date.parse(end) - Date.parse(start);
+      if (span > 2 * 86_400_000) {
+        return {
+          results: [{ statusCode: 200, data: { value: [], "@odata.nextLink": "/me/mailFolders/inbox/messages?$skip=100" } }],
+        };
+      }
+      return {
+        results: [{
+          statusCode: 200,
+          data: {
+            value: [
+              { id: "read", receivedDateTime: day(2), isRead: true, subject: "Read" },
+              { id: "unread", receivedDateTime: day(3), isRead: false, subject: "Unread", "@odata.type": "#microsoft.graph.eventMessageRequest" },
+            ],
+          },
+        }],
+      };
+    },
+  };
+  const window = { startIso: day(1), endIso: "2026-11-08T00:00:00.000Z" };
+  const slice = await readEmailWindowSlice(workiq, window, true);
+  assert.ok(paths.length > 1);
+  assert.ok(paths.every((path) => !path.includes("$skip")));
+  assert.deepEqual(slice.messages.map((message) => message.id), ["unread"]);
+  assert.equal(slice.messages[0].mailItemKind, "meetingRequest");
+  assert.equal(slice.hasMore, true);
+  assert.ok(Date.parse(slice.completedEndIso) < Date.parse(window.endIso));
+  assert.equal((await readEmailWindow(workiq, window, false)).length, 2);
+});
+
+test("fetchEmailDetail encodes the message id and reads meeting artifacts unprojected", async () => {
+  const paths = [];
+  const workiq = {
+    fetch: async ([path]) => {
+      paths.push(path);
+      return { results: [{ statusCode: 200, data: { id: "a/b", receivedDateTime: "2026-11-05T10:00:00Z", "@odata.type": "#microsoft.graph.eventMessageRequest" } }] };
+    },
+  };
+  const message = await fetchEmailDetail(workiq, "a/b", "meetingRequest");
+  assert.equal(message.mailItemKind, "meetingRequest");
+  assert.deepEqual(paths, ["/me/messages/a%2Fb"]);
+});
+
+test("syncTeamsChatsWindow reads one chat page and applies the window, unread, and system-message filters", async () => {
+  const chatPaths = [];
+  const workiq = {
+    fetch: async ([path]) => {
+      chatPaths.push(path);
+      return {
+        results: [{
+          statusCode: 200,
+          data: {
+            value: [
+              unreadChat("in", { lastMessagePreview: { body: { content: "x" }, from: { user: { displayName: "Other" } }, createdDateTime: "2026-11-05T10:00:00Z" } }),
+              unreadChat("old", { lastMessagePreview: { body: { content: "x" }, from: { user: { displayName: "Other" } }, createdDateTime: "2026-10-01T10:00:00Z" } }),
+              unreadChat("read", { viewpoint: { lastMessageReadDateTime: "2026-11-06T00:00:00Z" }, lastMessagePreview: { body: { content: "x" }, createdDateTime: "2026-11-05T11:00:00Z" } }),
+            ],
+            "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/chats?$skiptoken=next",
+          },
+        }],
+      };
+    },
+    fetchPartial: async (urls) => ({
+      results: urls.map(() => ({
+        statusCode: 200,
+        data: {
+          value: [
+            chatMessage("keep", "2026-11-05T10:00:00Z", "Keep"),
+            chatMessage("event", "2026-11-05T09:00:00Z", "", { eventDetail: { "@odata.type": "x" } }),
+            chatMessage("early", "2026-11-04T09:00:00Z", "Before the window"),
+          ],
+        },
+      })),
+    }),
+  };
+  const result = await syncTeamsChatsWindow(workiq, { startIso: "2026-11-05T00:00:00Z", endIso: "2026-11-06T00:00:00Z" });
+  assert.equal(chatPaths.length, 1);
+  assert.deepEqual(result.chats.map((chat) => chat.id), ["in"]);
+  assert.deepEqual(result.messages.map((message) => message.id), ["keep"]);
+  assert.deepEqual(result.stats, { chatsFetched: 3, chatsInWindow: 2, chatsUnread: 1, messagesFetched: 3 });
+});
+
+test("isDeletedOrSystemMessage keeps ordinary messages whose eventDetail and @removed are null", () => {
+  assert.equal(isDeletedOrSystemMessage({ messageType: "message", eventDetail: null, "@removed": null }), false);
+  assert.equal(isDeletedOrSystemMessage({ messageType: "systemEventMessage" }), true);
+  assert.equal(isDeletedOrSystemMessage({ eventDetail: { x: 1 } }), true);
+  assert.equal(isDeletedOrSystemMessage({ isDeleted: true }), true);
+  assert.equal(isDeletedOrSystemMessage({ deletedDateTime: "2026-11-05T00:00:00Z" }), true);
+  assert.equal(isDeletedOrSystemMessage({ "@removed": { reason: "deleted" } }), true);
+});
+
+test("sanitizeOutlookDeepLink strips session-pinning params from legacy OWA item links only", () => {
+  const pinned = "https://outlook.office365.com/owa/?ItemID=AAA&exvsurl=1&viewmodel=ReadMessageItem&sessionId=s1&nativeVersion=9";
+  assert.equal(
+    sanitizeOutlookDeepLink(pinned),
+    "https://outlook.office365.com/owa/?ItemID=AAA&exvsurl=1&viewmodel=ReadMessageItem",
+  );
+  assert.equal(isOutlookOwaDeepLink(pinned), true);
+  const mail = "https://outlook.office.com/mail/inbox?sessionId=keep";
+  assert.equal(sanitizeOutlookDeepLink(mail), mail);
+  assert.equal(isOutlookOwaDeepLink(mail), false);
+  assert.equal(sanitizeOutlookDeepLink("not a url"), "not a url");
+  assert.equal(sanitizeOutlookDeepLink(null), null);
+  assert.equal(
+    openUrlFor({ source: "email", messageId: "m", webLink: pinned }, "web"),
+    "https://outlook.office365.com/owa/?ItemID=AAA&exvsurl=1&viewmodel=ReadMessageItem",
+  );
+});
+
+test("graphDateTimeToUtcIso converts IANA zones and passes offset values through", () => {
+  assert.equal(graphDateTimeToUtcIso("2026-11-05T18:30:00", "UTC"), "2026-11-05T18:30:00.000Z");
+  assert.equal(graphDateTimeToUtcIso("2026-11-05T18:30:00", "America/Los_Angeles"), "2026-11-06T02:30:00.000Z");
+  assert.equal(graphDateTimeToUtcIso("2026-11-05T18:30:00+01:00", null), "2026-11-05T17:30:00.000Z");
+  assert.equal(graphDateTimeToUtcIso("", "UTC"), "");
+  assert.equal(normalizeGraphDateTime({ dateTime: "2026-11-05T18:30:00", timeZone: "America/Los_Angeles" }), "2026-11-06T02:30:00Z");
+});
+
+test("refresh walks the unread Inbox with a bounded receivedDateTime filter instead of the $skip link", async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "triage-inbox-walk-"));
+  t.after(() => rm(stateRoot, { recursive: true, force: true }));
+  const mailPaths = [];
+  const message = (id, receivedDateTime) => ({
+    id,
+    subject: `Subject ${id}`,
+    receivedDateTime,
+    bodyPreview: "Hello",
+    from: { emailAddress: { name: "Sender", address: "sender@example.com" } },
+  });
+  const workiq = {
+    fetch: async ([path]) => {
+      if (path.startsWith("/me?")) return { results: [{ statusCode: 404, error: "unavailable" }] };
+      if (path.startsWith("/me/chats")) return { results: [{ statusCode: 200, data: { value: [] } }] };
+      mailPaths.push(path);
+      const filter = decodeURIComponent(path.match(/\$filter=([^&]+)/)[1]);
+      if (filter === "isRead eq false") {
+        return {
+          results: [{
+            statusCode: 200,
+            data: {
+              value: [message("m3", "2026-11-05T12:00:00Z"), message("m2", "2026-11-05T11:00:00Z")],
+              "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/mailFolders('inbox')/messages?$skip=50",
+            },
+          }],
+        };
+      }
+      assert.equal(filter, "receivedDateTime le 2026-11-05T11:00:00Z and isRead eq false");
+      return { results: [{ statusCode: 200, data: { value: [message("m2", "2026-11-05T11:00:00Z"), message("m1", "2026-11-05T10:00:00Z")] } }] };
+    },
+    update: async () => ({}),
+    action: async () => ({}),
+  };
+  const triage = createTriage({ workiq, statePath: join(stateRoot, "state.json") });
+  const result = await triage.refresh();
+  assert.deepEqual(result.errors, []);
+  assert.equal(mailPaths.length, 2);
+  assert.ok(mailPaths.every((path) => !path.includes("$skip")));
+  assert.deepEqual(result.items.filter((item) => item.source === "email").map((item) => item.rawId).sort(), ["m1", "m2", "m3"]);
+});
+
+test("calendarDetail falls back to the loaded agenda when WorkIQ rate limits the day schedule", async (t) => {
+  const { triage, item } = await inviteTriage(t, {
+    event: {
+      id: "event-1",
+      start: graphUtc(inviteDay(1, 10)),
+      end: graphUtc(inviteDay(1, 11)),
+      attendees: [],
+    },
+    onCalendarView: () => {
+      throw new WorkIqError("workiq_rate_limited", "calendarView: HTTP 429 [TooManyRequests] (retry after 62s)");
+    },
+  });
+  const detail = await triage.getDetail(item.id);
+  assert.equal(detail.cached, null);
+  assert.equal(detail.warning, null);
+  assert.equal(detail.item.eventId, "event-1");
 });

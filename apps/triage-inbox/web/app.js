@@ -538,7 +538,8 @@ async function selectItem(item) {
     $("detailLoading").hidden = true;
     $("detailError").hidden = true;
     renderDetail(result);
-    loadIntel(item, { localOnly: false });
+    // Selecting an item reads only local context; the X-Ray button fetches the directory and related items on demand.
+    loadIntel(item, { localOnly: true });
   } catch (error) {
     if (seq !== detailSeq || selectedId !== item.id) return;
     showDetailError(error);
@@ -2482,7 +2483,7 @@ async function loadIntel(item, { localOnly = false, open = false } = {}) {
   intel = { id: item.id, status: "loading", data: intel?.id === item.id ? intel.data : null, open, answer: intel?.id === item.id ? intel.answer : null };
   renderIntel();
   try {
-    const data = await post("/api/intel", { id: item.id, ...(localOnly ? { localOnly: true } : {}) });
+    const data = await post("/api/intel", { id: item.id, localOnly: Boolean(localOnly) });
     if (seq !== intelSeq || selectedId !== item.id) return;
     intel = { ...intel, status: "done", open, data };
   } catch (error) {

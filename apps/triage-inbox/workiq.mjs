@@ -6,6 +6,20 @@ export const WORKIQ_MCP_RESOURCE = "https://workiq.svc.cloud.microsoft/mcp";
 export const WORKIQ_MCP_PROTOCOL_VERSION = "2025-06-18";
 export const WORKIQ_SCOPE = "fdcc1f02-fc51-4226-8753-f668596af7f7/WorkIQAgent.Ask";
 export const WORKIQ_CLIENT_ID = "ba081686-5d24-4bc6-a0d6-d034ecffed87";
+export const WORKIQ_TOOL_NAMES = Object.freeze([
+  "ask",
+  "retrieve",
+  "list_agents",
+  "fetch",
+  "fetch_blob",
+  "call_function",
+  "create_entity",
+  "update_entity",
+  "delete_entity",
+  "do_action",
+  "search_paths",
+  "get_schema",
+]);
 
 const WORKIQ_TIMEOUT_MS = 60_000;
 const WORKIQ_SEMANTIC_TIMEOUT_MS = 300_000;
@@ -20,10 +34,13 @@ const WORKIQ_RETRYABLE_TOOLS = new Set([
 ]);
 const WORKIQ_RETRY_BASE_DELAY_MS = 500;
 const WORKIQ_MAX_ATTEMPTS = 3;
+const WORKIQ_FAST_FAIL_COOLDOWN_MS = 5000;
+const WORKIQ_DEFAULT_COOLDOWN_MS = 60_000;
 
 const HOST_UNAVAILABLE = /MCP host is not available on this session/i;
 const BRIDGE_FALLBACK_ERROR =
   /capability is not available in this session|MCP host is not available|not connected|WorkIQ plugin is not ready|Authentication requires user interaction|Sign in again|OAuth token expired/i;
+const TOO_MANY_REQUESTS = /\b429\b|TooManyRequests/i;
 const RATE_LIMITED_ERROR = /\bHTTP (?:429|502|503|504)\b|TooManyRequests|throttl|rate[- ]?limit|temporarily unavailable/i;
 
 export class WorkIqError extends Error {
@@ -31,6 +48,132 @@ export class WorkIqError extends Error {
     super(message);
     this.code = code;
   }
+}
+
+export class WorkIqToolError extends WorkIqError {
+  constructor(message, retryable = false, httpStatus = 0, requestId = null) {
+    super("workiq_tool_error", message);
+    this.name = "WorkIqToolError";
+    this.retryable = retryable;
+    this.httpStatus = httpStatus;
+    this.requestId = requestId;
+  }
+}
+
+function parseJsonText(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+/** Prefer structured MCP content, falling back to the first text block. */
+export function extractWorkIqPayload(result) {
+  if (!result || typeof result !== "object") return null;
+  if (result.structuredContent !== undefined) return result.structuredContent;
+  const text = result.content?.find((item) => typeof item?.text === "string")?.text;
+  return text ? parseJsonText(text) : null;
+}
+
+function stringField(value, fields) {
+  if (!value || typeof value !== "object") return null;
+  for (const field of fields) {
+    const candidate = value[field];
+    if (typeof candidate === "string" && candidate.trim()) return candidate;
+  }
+  return null;
+}
+
+function extractLegacyRawResponse(value) {
+  const rawResponse = value?.rawResponse;
+  if (typeof rawResponse !== "string" || !rawResponse.trim()) return null;
+  const parsed = parseJsonText(rawResponse);
+  const messages = parsed && typeof parsed === "object" ? parsed.messages : null;
+  if (!Array.isArray(messages)) return null;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const text = messages[index]?.text;
+    if (typeof text === "string" && text.trim()) return text;
+  }
+  return null;
+}
+
+/** Handles live `answer`, documented `response`, and legacy reply envelopes. */
+export function extractWorkIqAnswer(result) {
+  const payload = extractWorkIqPayload(result);
+  if (typeof payload === "string") return payload;
+  return stringField(payload, ["answer", "response", "reply"]) ?? extractLegacyRawResponse(payload) ?? "";
+}
+
+export function validateWorkIqToolSurface(tools) {
+  const names = new Set((tools ?? []).map((tool) => tool?.name));
+  const expected = new Set(WORKIQ_TOOL_NAMES);
+  const missing = WORKIQ_TOOL_NAMES.filter((name) => !names.has(name));
+  const unknown = [...names].filter((name) => name && !expected.has(name)).sort();
+  return { exact: missing.length === 0 && unknown.length === 0, satisfied: missing.length === 0, missing, unknown };
+}
+
+export function normalizeWorkIqToolName(name) {
+  const lower = String(name ?? "").toLowerCase();
+  return (
+    WORKIQ_TOOL_NAMES.find(
+      (tool) =>
+        lower === tool
+        || lower.endsWith(`__${tool}`)
+        || lower.endsWith(`.${tool}`)
+        || lower.endsWith(`:${tool}`)
+        || lower.endsWith(`-${tool}`),
+    ) ?? null
+  );
+}
+
+function workIqPathWithoutQuery(path) {
+  try {
+    return decodeURIComponent(String(path ?? "").split(/[?#]/, 1)[0]).toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+export function classifyWorkIqPath(path) {
+  const normalized = workIqPathWithoutQuery(path);
+  if (
+    /^\/(?:me|users\/[^/]+)\/(?:messages|mailfolders)(?:\/|$)/.test(normalized)
+    || /^\/me\/sendmail(?:\/|$)/.test(normalized)
+  ) return "mail";
+  if (/^\/(?:me|users\/[^/]+)\/(?:events|calendar|calendars|calendarview)(?:\/|$)/.test(normalized)) return "calendar";
+  if (/^\/(?:me\/(?:chats|joinedteams|presence)|chats|teams|communications)(?:\/|$)/.test(normalized)) return "teams";
+  if (
+    /^\/(?:me\/drive|drives|sites|shares)(?:\/|$)/.test(normalized)
+    || /^\/groups\/?$/.test(normalized)
+    || /^\/groups\/[^/]+\/(?:drive|sites)(?:\/|$)/.test(normalized)
+    || /^\/search(?:\/|$)/.test(normalized)
+  ) return "files";
+  if (
+    /^\/(?:users|people)(?:\/|$)/.test(normalized)
+    || /^\/me\/(?:manager|directreports|contacts|people|photo|photos)(?:\/|$)/.test(normalized)
+    || normalized === "/me"
+  ) return "people";
+  if (/^\/(?:planner|me\/(?:planner|todo))(?:\/|$)/.test(normalized) || /^\/groups\/[^/]+\/planner(?:\/|$)/.test(normalized)) {
+    return "tasks";
+  }
+  if (/^\/businessapps(?:\/|$)/.test(normalized)) return "businessapps";
+  return null;
+}
+
+/** True when the payload is a batched `{ results: [...] }` fetch envelope. */
+export function isEntityResultsEnvelope(payload) {
+  return Boolean(payload && typeof payload === "object" && Array.isArray(payload.results));
+}
+
+export function extractWorkIqEntityResults(payload) {
+  if (!payload || typeof payload !== "object") return [];
+  const candidates = Array.isArray(payload.results) ? payload.results : "data" in payload ? [payload] : [];
+  return candidates.flatMap((candidate) => {
+    if (!candidate || typeof candidate !== "object") return [];
+    if (!candidate.data || typeof candidate.data !== "object") return [];
+    return [{ data: candidate.data, statusCode: typeof candidate.statusCode === "number" ? candidate.statusCode : 200 }];
+  });
 }
 
 function errorText(value) {
@@ -123,16 +266,23 @@ function describeCall(name, args) {
 }
 
 function markRateLimit(error, payload = null) {
-  if (RATE_LIMITED_ERROR.test(String(error?.message ?? ""))) {
+  const message = String(error?.message ?? "");
+  if (RATE_LIMITED_ERROR.test(message)) {
     error.rateLimited = true;
+    if (TOO_MANY_REQUESTS.test(message)) error.tooManyRequests = true;
     const resultRetryAfterSeconds = Array.isArray(payload?.results)
-      ? payload.results.find((entry) => Number(entry?.retryAfterSeconds) > 0)?.retryAfterSeconds
+      ? payload.results.find((entry) =>
+          Number(entry?.retryAfterSeconds ?? entry?.error?.retryAfterSeconds) > 0)
+        ?.retryAfterSeconds ??
+        payload.results.find((entry) => Number(entry?.error?.retryAfterSeconds) > 0)?.error?.retryAfterSeconds
       : undefined;
+    const messageRetryAfterSeconds = message.match(/\(retry after (\d+)s\)/i)?.[1];
     const retrySec = Number(
       payload?.retryAfterSeconds ??
       resultRetryAfterSeconds ??
       payload?.error?.retryAfterSeconds ??
       payload?.headers?.["retry-after"] ??
+      messageRetryAfterSeconds ??
       0,
     );
     if (Number.isFinite(retrySec) && retrySec > 0) {
@@ -154,11 +304,29 @@ function markTransientToolError(error, detail) {
   return error;
 }
 
-export function unwrapWorkIqResult(result, label, { validateResults = true } = {}) {
+export function isTransientFailure(error) {
+  if (error instanceof WorkIqToolError || error?.retryable !== undefined) return Boolean(error.retryable);
+  if (!(error instanceof Error)) return false;
+  return /timed out|HTTP 5\d\d|HTTP 429|empty response|network|fetch failed|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up/i
+    .test(error.message);
+}
+
+export { isPermanentToolError };
+
+export function unwrapWorkIqResult(
+  result,
+  label,
+  { validateResults = true, tolerateEntityErrors = !validateResults } = {},
+) {
   if (!result || typeof result !== "object") {
     throw new WorkIqError("workiq_empty", `${label}: WorkIQ returned no result`);
   }
   if (result.isError) {
+    if (tolerateEntityErrors || !validateResults) {
+      const payload = extractWorkIqPayload(result);
+      const parsed = typeof payload === "string" ? parseJsonText(payload) : payload;
+      if (isEntityResultsEnvelope(parsed)) return parsed;
+    }
     const detail = extractIsErrorDetail(result);
     const rejected = markTransientToolError(markRateLimit(
       new WorkIqError("workiq_error", `${label}: ${detail || "WorkIQ rejected the tool call (empty MCP error response)"}`),
@@ -611,8 +779,35 @@ export function createWorkIqHostAdapter({
       .test(String(error?.message ?? error));
   }
 
-  async function call(name, args, options) {
+  function cooldownError(label, waitMs) {
+    const seconds = Math.ceil(waitMs / 1000);
+    const error = new WorkIqError(
+      "workiq_rate_limited",
+      `${label}: HTTP 429 [TooManyRequests] WorkIQ is cooling down (retry after ${seconds}s)`,
+    );
+    error.rateLimited = true;
+    error.tooManyRequests = true;
+    error.retryAfterSeconds = seconds;
+    error.retryAfterMs = seconds * 1000;
+    return error;
+  }
+
+  function noteEntityRateLimits(payload) {
+    if (!isEntityResultsEnvelope(payload)) return;
+    for (const entry of payload.results) {
+      const retrySeconds = Number(entry?.retryAfterSeconds ?? entry?.error?.retryAfterSeconds ?? 0);
+      if (Number(entry?.statusCode) === 429 && retrySeconds > 0) {
+        cooldownUntil = Math.max(cooldownUntil, Date.now() + retrySeconds * 1000);
+      }
+    }
+  }
+
+  async function call(name, args, options = {}) {
     await discoverTools();
+    const unwrapOptions = {
+      validateResults: options.validateResults ?? true,
+      tolerateEntityErrors: options.tolerateEntityErrors ?? options.validateResults === false,
+    };
     const label = describeCall(name, args);
     const callArgs = {
       serverName,
@@ -635,6 +830,7 @@ export function createWorkIqHostAdapter({
     };
     for (let attempt = 0; ; attempt++) {
       const waitCooldown = cooldownUntil - Date.now();
+      if (waitCooldown > WORKIQ_FAST_FAIL_COOLDOWN_MS) throw cooldownError(label, waitCooldown);
       if (waitCooldown > 0) {
         await new Promise((resolve) => setTimeout(resolve, waitCooldown));
       }
@@ -647,7 +843,8 @@ export function createWorkIqHostAdapter({
       }
       if (!failure) {
         try {
-          const value = unwrapWorkIqResult(result, label, options);
+          const value = unwrapWorkIqResult(result, label, unwrapOptions);
+          noteEntityRateLimits(value);
           if (!useBridge) await publishVerifiedDirectCall(result, label);
           reconnectAttempted = false;
           return value;
@@ -655,7 +852,8 @@ export function createWorkIqHostAdapter({
           if (bridgePath && !useBridge && BRIDGE_FALLBACK_ERROR.test(String(error?.message ?? error))) {
             try {
               const bridged = await callBridge("callTool", callArgs);
-              const value = unwrapWorkIqResult(bridged, label, options);
+              const value = unwrapWorkIqResult(bridged, label, unwrapOptions);
+              noteEntityRateLimits(value);
               useBridge = true;
               reconnectAttempted = false;
               return value;
@@ -670,6 +868,14 @@ export function createWorkIqHostAdapter({
           if (!error?.emptyErrorResponse && !error?.rateLimited && !retryableRead && !reconnectable) throw error;
         }
       }
+      if (failure?.tooManyRequests) {
+        const retryAfterMs = failure.retryAfterMs ?? 0;
+        if (retryAfterMs > 0) {
+          cooldownUntil = Math.max(cooldownUntil, Date.now() + retryAfterMs);
+        } else if (attempt >= 2) {
+          cooldownUntil = Math.max(cooldownUntil, Date.now() + WORKIQ_DEFAULT_COOLDOWN_MS);
+        }
+      }
       const reconnectable = attempt === 0 && shouldReconnect(failure, name);
       if (reconnectable && await reconnect()) {
         await discoverTools();
@@ -682,8 +888,8 @@ export function createWorkIqHostAdapter({
       if (inlineRetry) {
         const delay = failure.retryAfterMs
           ?? (failure.rateLimited ? rateLimitDelayMs : WORKIQ_RETRY_BASE_DELAY_MS * 2 ** attempt);
-        if (delay > 0 && delay <= 5000) {
-          cooldownUntil = Math.max(cooldownUntil, Date.now() + delay);
+        if (delay > 0 && delay <= WORKIQ_FAST_FAIL_COOLDOWN_MS) {
+          if (failure.tooManyRequests) cooldownUntil = Math.max(cooldownUntil, Date.now() + delay);
           await new Promise((resolve) => setTimeout(resolve, delay));
           continue;
         }
@@ -717,9 +923,9 @@ export function createWorkIqHostAdapter({
           const result = directClient
             ? await hostCallTool(params)
             : await hostCallTool({ serverName, originServerName: serverName, ...params });
-          const label = describeCall(params?.toolName ?? "raw call", params?.arguments ?? {});
-          unwrapWorkIqResult(result, label);
-          await publishVerifiedDirectCall(result, label);
+          if (!result?.isError) {
+            await publishVerifiedDirectCall(result, describeCall(params?.toolName ?? "raw call", params?.arguments ?? {}));
+          }
           return result;
         }
       : null,
@@ -733,7 +939,8 @@ export function createWorkIqHostAdapter({
     retrieve: (args) => optionalTool("retrieve", args),
     ask: (args) => optionalTool("ask", args),
     fetch: (entityUrls) => call("fetch", { entityUrls }),
-    fetchPartial: (entityUrls) => call("fetch", { entityUrls }, { validateResults: false }),
+    fetchPartial: (entityUrls) =>
+      call("fetch", { entityUrls }, { validateResults: false, tolerateEntityErrors: true }),
     update: (entityUrl, jsonBody) => call("update_entity", { entityUrl, jsonBody }),
     action: (actionUrl, jsonBody = {}) => call("do_action", { actionUrl, jsonBody }),
     delete: async (entityUrl) => {

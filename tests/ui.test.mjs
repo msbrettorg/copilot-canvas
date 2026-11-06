@@ -42,6 +42,7 @@ class FakeElement extends FakeNode {
     this.childNodes = [];
     this.hidden = false;
     this.style = { setProperty() {} };
+    this.classList = { toggle() {}, add() {}, remove() {}, contains: () => false };
   }
 
   get children() {
@@ -131,6 +132,8 @@ async function loadApp() {
     },
     CSS: { escape: (value) => value },
     innerWidth: 1200,
+    clearTimeout,
+    setTimeout,
     requestAnimationFrame: (callback) => callback(),
   });
   vm.runInContext(
@@ -139,6 +142,20 @@ globalThis.__app = {
   renderCalendarDetail,
   renderMessageBody,
   intelPerson,
+  selectItem,
+  root: (id) => $(id),
+  state: {
+    setItems(next) { items = next; },
+    setPost(fn) { post = fn; },
+    stubChrome() {
+      renderList = () => {};
+      syncPane = () => {};
+      renderDetail = () => {};
+      renderDetailHeader = () => {};
+      showDetailLoading = () => {};
+    },
+    intel: () => intel,
+  },
   setAgenda(events, loaded) { calendarEvents = events; agendaLoaded = loaded; },
 };`,
     context,
@@ -394,7 +411,29 @@ test("intelPerson omits the directory-match warning while only local context is 
   assert.match(known.textContent, /Your manager/);
 });
 
-test("selecting an item resolves the sender's directory context", async () => {
-  const source = await readFile(new URL("../apps/triage-inbox/web/app.js", import.meta.url), "utf8");
-  assert.match(source, /renderDetail\(result\);\s*loadIntel\(item, \{ localOnly: false \}\);/);
+test("selecting an item reads local intel only, and X-Ray fetches the directory on demand", async () => {
+  const app = await loadApp();
+  const calls = [];
+  const item = { id: "item-1", source: "email", sender: "Sample Sender", title: "Plan", status: "action" };
+  app.state.setItems([item]);
+  app.state.stubChrome();
+  app.state.setPost(async (path, body) => {
+    calls.push({ path, body });
+    if (path === "/api/detail") return { id: "item-1", source: "email", item, blocks: [], attachments: [], to: [], cc: [], from: { name: "Sample Sender" } };
+    return { person: null, related: [], localOnly: body.localOnly === true, warnings: [] };
+  });
+  await app.selectItem(item);
+  await new Promise((resolve) => setImmediate(resolve));
+  const intelCalls = calls.filter((call) => call.path === "/api/intel");
+  assert.equal(intelCalls.length, 1);
+  assert.equal(intelCalls[0].body.localOnly, true);
+  assert.equal(app.state.intel().data.localOnly, true);
+
+  const toggle = app.root("detailIntel").querySelectorAll("button").find((node) => node.textContent === "X-Ray");
+  assert.ok(toggle, "X-Ray button is rendered");
+  toggle.onclick();
+  await new Promise((resolve) => setImmediate(resolve));
+  const after = calls.filter((call) => call.path === "/api/intel");
+  assert.equal(after.length, 2);
+  assert.equal(after[1].body.localOnly, false);
 });

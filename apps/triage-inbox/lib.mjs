@@ -11,7 +11,7 @@ import { dirname, join, normalize, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { SEED_ITEMS, buildSeedEvents } from "./seed.mjs";
-import { extractWorkIqEntityOutcomes, WorkIqError } from "./workiq.mjs";
+import { extractWorkIqEntityOutcomes, extractWorkIqEntityResults, WorkIqError } from "./workiq.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB_ROOT = resolve(HERE, "web");
@@ -20,10 +20,20 @@ const EXTENSIONS_ROOT = process.env.COPILOT_EXTENSIONS_DIR || join(COPILOT_HOME,
 export const STATE_PATH = join(EXTENSIONS_ROOT, "triage-inbox", "artifacts", "state.json");
 export const BRIDGE_PATH = join(EXTENSIONS_ROOT, "triage-inbox", "artifacts", "bridge.json");
 const MAX_EMAIL_PAGES = 10;
-const MAX_CHAT_PAGES = 8;
-const MAX_PREVIEW_ENRICH = 6;
-const PREVIEW_BATCH_SIZE = 6;
-const PREVIEW_TIMEOUT_MS = 8000;
+export const CHAT_PAGE_SIZE = 50;
+export const MESSAGE_PAGE_SIZE = 50;
+export const FETCH_BATCH_SIZE = 20;
+export const CHAT_FIELDS = "id,chatType,topic,tenantId,lastUpdatedDateTime,viewpoint,webUrl";
+const PERSISTED_MESSAGE_LIMIT = 20;
+export const MAIL_PAGE_SIZE = 100;
+export const MAIL_MAX_WINDOW_SPLITS = 30;
+export const MAIL_FIELDS =
+  "id,conversationId,receivedDateTime,lastModifiedDateTime,from,toRecipients,ccRecipients,subject,isRead,importance,webLink";
+export const MAIL_DETAIL_FIELDS = `${MAIL_FIELDS},bodyPreview,body`;
+export const CALENDAR_MAX_PAGES = 10;
+export const CALENDAR_FIELDS =
+  "id,iCalUId,subject,start,end,organizer,attendees,bodyPreview,location,isCancelled,lastModifiedDateTime,isOnlineMeeting,onlineMeeting,onlineMeetingUrl,webLink";
+export const CALENDAR_DETAIL_FIELDS = `${CALENDAR_FIELDS},body`;
 const DETAIL_TTL_MS = 5 * 60_000;
 const MEMBERS_TTL_MS = 30 * 60_000;
 const PAGE_SIZE = 50;
@@ -1030,16 +1040,149 @@ function resolveMessageBlocks(message) {
   return extractEmailBlocks(message.body, message.bodyPreview);
 }
 
+// Graph dateTimeTimeZone -> UTC ISO instant. Offset-less values are read in their own zone, not the machine's.
+export function graphDateTimeToUtcIso(dateTime, timeZone) {
+  const trimmed = String(dateTime ?? "").trim();
+  if (!trimmed) return "";
+
+  if (/[zZ]$/.test(trimmed) || /[+-]\d\d:?\d\d$/.test(trimmed)) {
+    const parsed = Date.parse(trimmed);
+    return Number.isNaN(parsed) ? trimmed : new Date(parsed).toISOString();
+  }
+
+  const zone = String(timeZone ?? "").trim();
+  if (!zone || /^(?:UTC|Etc\/UTC|GMT)$/i.test(zone)) {
+    const parsed = Date.parse(`${trimmed}Z`);
+    return Number.isNaN(parsed) ? trimmed : new Date(parsed).toISOString();
+  }
+
+  const match = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?$/);
+  if (!match) return trimmed;
+
+  const [, year, month, day, hour, minute, second, fraction = ""] = match;
+  const desiredUtc = Date.UTC(
+    Number(year),
+    Number(month) - 1,
+    Number(day),
+    Number(hour),
+    Number(minute),
+    Number(second),
+    Number(fraction.padEnd(3, "0").slice(0, 3)),
+  );
+
+  try {
+    const formatter = new Intl.DateTimeFormat("en-CA", {
+      timeZone: zone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      fractionalSecondDigits: 3,
+      hourCycle: "h23",
+    });
+    let candidate = desiredUtc;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const parts = Object.fromEntries(
+        formatter
+          .formatToParts(new Date(candidate))
+          .filter((part) => part.type !== "literal")
+          .map((part) => [part.type, part.value]),
+      );
+      const representedUtc = Date.UTC(
+        Number(parts.year),
+        Number(parts.month) - 1,
+        Number(parts.day),
+        Number(parts.hour),
+        Number(parts.minute),
+        Number(parts.second),
+        Number(parts.fractionalSecond),
+      );
+      const adjustment = desiredUtc - representedUtc;
+      if (adjustment === 0) return new Date(candidate).toISOString();
+      candidate += adjustment;
+    }
+    return new Date(candidate).toISOString();
+  } catch {
+    // A non-IANA zone must not fail ingestion; treat the wall-clock value as UTC.
+    return new Date(desiredUtc).toISOString();
+  }
+}
+
+function isIanaTimeZone(zone) {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: zone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function normalizeGraphDateTime(value) {
   if (!value) return null;
   if (typeof value === "string") return value;
   const raw = String(value.dateTime ?? "").trim();
   if (!raw) return null;
   const tz = String(value.timeZone ?? "").trim();
-  if ((/^utc$/i.test(tz) || /^etc\/gmt$/i.test(tz)) && !/(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw)) {
-    return `${raw.replace(/\.0+$/, "")}Z`;
+  const isUtc = /^(?:utc|etc\/gmt|etc\/utc|gmt)$/i.test(tz);
+  if (!isUtc && !(tz && isIanaTimeZone(tz))) return raw;
+  const iso = graphDateTimeToUtcIso(raw.replace(/(\.\d*?)0+(?=$|[zZ+-])/, "$1").replace(/\.$/, ""), tz);
+  return iso ? iso.replace(/\.000Z$/, "Z") : raw;
+}
+
+// ------------------------------------------------------- Outlook deep links
+
+const OUTLOOK_HOSTS = new Set(["outlook.office.com", "outlook.office365.com", "outlook.live.com"]);
+// Allowlist: M365 Copilot has shipped several session-pinning params that break the link when clicked later.
+const CANONICAL_OUTLOOK_PARAMS = new Set(["itemid", "exvsurl", "viewmodel", "path", "id", "folder", "realm"]);
+
+function isLegacyOwaItemLink(parsed) {
+  if (!OUTLOOK_HOSTS.has(parsed.hostname.toLowerCase())) return false;
+  const path = parsed.pathname.toLowerCase();
+  if (path !== "/owa" && !path.startsWith("/owa/")) return false;
+  for (const key of parsed.searchParams.keys()) {
+    if (key.toLowerCase() === "itemid") return true;
   }
-  return raw;
+  return false;
+}
+
+export function isOutlookOwaDeepLink(url) {
+  if (!url) return false;
+  try {
+    return isLegacyOwaItemLink(new URL(url));
+  } catch {
+    return false;
+  }
+}
+
+export function sanitizeOutlookDeepLink(url) {
+  if (!url) return url;
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return url;
+  }
+  if (!isLegacyOwaItemLink(parsed)) return url;
+  let mutated = false;
+  for (const key of Array.from(parsed.searchParams.keys())) {
+    if (!CANONICAL_OUTLOOK_PARAMS.has(key.toLowerCase())) {
+      parsed.searchParams.delete(key);
+      mutated = true;
+    }
+  }
+  return mutated ? parsed.toString() : url;
+}
+
+export function forceBrowserForOutlookDeepLink(url, newOutlookForWindowsInstalled, platform = process.platform) {
+  if (platform !== "win32" || !url || !newOutlookForWindowsInstalled) return url;
+  if (url.startsWith("microsoft-edge:")) return url;
+  try {
+    return isLegacyOwaItemLink(new URL(url)) ? `microsoft-edge:${url}` : url;
+  } catch {
+    return url;
+  }
 }
 
 export function dedupePeople(list) {
@@ -1379,7 +1522,7 @@ function calendarItem(message, name, status) {
     rawId: message.id,
     messageId: message.id,
     eventId: null,
-    webLink: message.webLink ?? null,
+    webLink: sanitizeOutlookDeepLink(message.webLink) ?? null,
     title: message.subject || "(no subject)",
     sender: name,
     summary: stripText(message.bodyPreview),
@@ -1427,7 +1570,7 @@ export function classifyEmail(message) {
     source: "email",
     rawId: message.id,
     messageId: message.id,
-    webLink: message.webLink ?? null,
+    webLink: sanitizeOutlookDeepLink(message.webLink) ?? null,
     title: subject || "(no subject)",
     sender: name,
     summary: stripText(preview),
@@ -1470,10 +1613,15 @@ export function normalizeItem(input) {
     source,
     rawId,
     ...(source === "teams"
-      ? { chatId: input.chatId ?? rawId, tenantId: input.tenantId ?? null }
+      ? {
+          chatId: input.chatId ?? rawId,
+          tenantId: input.tenantId ?? null,
+          ...(Array.isArray(input.messages) && input.messages.length ? { messages: input.messages } : {}),
+          ...(Array.isArray(input.members) && input.members.length ? { members: input.members } : {}),
+        }
       : { messageId: input.messageId ?? rawId }),
     ...(source === "calendar" ? { eventId: input.eventId ?? null } : {}),
-    webLink: input.webLink ?? null,
+    webLink: sanitizeOutlookDeepLink(input.webLink) ?? null,
     title: String(input.title ?? "(untitled)"),
     sender: String(input.sender ?? ""),
     summary: String(input.summary ?? ""),
@@ -1550,22 +1698,484 @@ function previewSender(from) {
   );
 }
 
-export function normalizeWorkIqChat(chat) {
+// A verified /me profile (not the built-in sample identity) lets us recognize the signed-in user's own messages.
+function isVerifiedIdentity() {
+  return activeIdentity.email !== DEFAULT_PROFILE.email;
+}
+
+export function normalizeWorkIqChat(chat, { currentUserId = null } = {}) {
   const preview = chat?.lastMessagePreview ?? {};
-  const previewAt = Date.parse(preview.createdDateTime);
+  // lastUpdatedDateTime only moves on rename/roster changes, so the last message's own time wins.
+  const activityAt = preview.createdDateTime || preview.lastModifiedDateTime || chat?.lastUpdatedDateTime || null;
+  const previewAt = Date.parse(activityAt);
   const readAt = Date.parse(chat?.viewpoint?.lastMessageReadDateTime);
-  const hasUnreadMessages = Number.isFinite(previewAt) && Number.isFinite(readAt) && previewAt > readAt;
+  let hasUnreadMessages = Number.isFinite(previewAt) && (!Number.isFinite(readAt) || previewAt > readAt);
   const rawBody = preview.body;
   const body = typeof rawBody === "string" ? rawBody : rawBody?.content ?? "";
+  const from = previewSender(preview.from);
+  const fromId = String(preview.from?.user?.id ?? "").trim().toLowerCase();
+  // The last message is mine, so I have read the thread.
+  if (
+    hasUnreadMessages &&
+    isVerifiedIdentity() &&
+    ((from && matchers.self.test(from)) || (currentUserId && fromId && fromId === String(currentUserId).trim().toLowerCase()))
+  ) {
+    hasUnreadMessages = false;
+  }
   return {
     ...chat,
     hasUnreadMessages,
     lastMessagePreview: {
       body,
-      from: previewSender(preview.from),
-      createdDateTime: preview.createdDateTime ?? null,
+      from,
+      createdDateTime: preview.createdDateTime ?? preview.lastModifiedDateTime ?? null,
       mentions: Array.isArray(preview.mentions) ? preview.mentions : [],
     },
+  };
+}
+
+// Graph sets "@removed" and "eventDetail" to an explicit null on ordinary messages, so only a non-null value counts.
+export function isDeletedOrSystemMessage(source) {
+  const messageType = clean(source?.messageType);
+  return (
+    source?.["@removed"] != null ||
+    source?.isDeleted === true ||
+    Boolean(clean(source?.deletedDateTime)) ||
+    Boolean(messageType && !/^message$/i.test(messageType)) ||
+    source?.eventDetail != null
+  );
+}
+
+const messageTime = (message) => String(message?.createdDateTime ?? "");
+
+export function messagePath(chatId) {
+  return `/chats/${encodeURIComponent(chatId)}/messages?$top=${MESSAGE_PAGE_SIZE}&$orderby=createdDateTime%20desc`;
+}
+
+// Single /me/chats page: WorkIQ rejects Graph's $skiptoken continuation, so the ~50 newest chats are all we can see.
+export async function fetchCandidateChats(workiq, { currentUserId = null } = {}) {
+  const path = `/me/chats?$select=${CHAT_FIELDS}&$expand=lastMessagePreview&$top=${CHAT_PAGE_SIZE}`;
+  const data = workIqFetchData(await workiq.fetch([path]), 0, "chat page 1");
+  const values = Array.isArray(data?.value) ? data.value : [];
+  const chats = values.map((value) => normalizeWorkIqChat(value, { currentUserId }));
+  return {
+    chats,
+    unread: chats.filter((chat) => chat.hasUnreadMessages),
+    fetched: values.length,
+    truncated: values.length >= CHAT_PAGE_SIZE && Boolean(data?.["@odata.nextLink"]),
+  };
+}
+
+// Reads recent messages for each chat in batches of FETCH_BATCH_SIZE. A failed entity or batch never discards the rest.
+export async function fetchRecentMessages(workiq, chats, { signal } = {}) {
+  const outcomes = new Map();
+  const fetchBatch = workiq.fetchPartial ?? workiq.fetch;
+  for (let offset = 0; offset < chats.length; offset += FETCH_BATCH_SIZE) {
+    if (signal?.aborted) break;
+    const batch = chats.slice(offset, offset + FETCH_BATCH_SIZE);
+    let results;
+    try {
+      const payload = await fetchBatch.call(workiq, batch.map((chat) => messagePath(chat.id)), {
+        tolerateEntityErrors: true,
+      });
+      results = extractWorkIqEntityOutcomes(payload);
+      if (results.length !== batch.length) throw new Error("WorkIQ Teams read returned a mismatched result count");
+    } catch (error) {
+      for (const chat of batch) outcomes.set(chat.id, { ok: false, statusCode: 0, error: error.message });
+      // Stop fanning out into a throttled service; the remaining chats reuse their cached messages.
+      if (error?.rateLimited) break;
+      continue;
+    }
+    batch.forEach((chat, index) => {
+      const outcome = results[index];
+      const ok = outcome.statusCode >= 200 && outcome.statusCode < 300 && Boolean(outcome.data);
+      outcomes.set(chat.id, {
+        ok,
+        statusCode: outcome.statusCode,
+        error: outcome.error,
+        values: ok && Array.isArray(outcome.data.value) ? outcome.data.value : [],
+      });
+    });
+  }
+  return outcomes;
+}
+
+function buildTeamsWindow(window) {
+  const start = Date.parse(window?.startIso);
+  const end = Date.parse(window?.endIso);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) throw new TriageError("invalid_window", "Teams sync needs a valid time window");
+  if (start >= end) throw new TriageError("invalid_window", "Teams sync startIso must be earlier than endIso");
+  return { start, end };
+}
+
+const inWindow = (value, bounds) => {
+  const at = Date.parse(value);
+  return Number.isFinite(at) && at >= bounds.start && at < bounds.end;
+};
+
+export async function syncTeamsChatsWindow(workiq, window, { currentUserId = null } = {}) {
+  const bounds = buildTeamsWindow(window);
+  const candidates = await fetchCandidateChats(workiq, { currentUserId });
+  const activity = (chat) => chat.lastMessagePreview?.createdDateTime || chat.lastUpdatedDateTime;
+  const inWindowChats = candidates.chats.filter((chat) => inWindow(activity(chat), bounds));
+  const chats = inWindowChats
+    .filter((chat) => chat.hasUnreadMessages)
+    .sort((a, b) => String(activity(b)).localeCompare(String(activity(a))) || a.id.localeCompare(b.id));
+  const outcomes = await fetchRecentMessages(workiq, chats);
+  const messages = [];
+  let messagesFetched = 0;
+  for (const chat of chats) {
+    const outcome = outcomes.get(chat.id);
+    if (!outcome?.ok) continue;
+    messagesFetched += outcome.values.length;
+    for (const value of outcome.values) {
+      if (isDeletedOrSystemMessage(value) || !value?.id || !inWindow(value.createdDateTime, bounds)) continue;
+      messages.push({ chatId: chat.id, ...value });
+    }
+  }
+  messages.sort((a, b) => messageTime(b).localeCompare(messageTime(a)) || a.chatId.localeCompare(b.chatId));
+  return {
+    chats,
+    messages,
+    stats: {
+      chatsFetched: candidates.fetched,
+      chatsInWindow: inWindowChats.length,
+      chatsUnread: chats.length,
+      messagesFetched,
+    },
+  };
+}
+
+// ------------------------------------------------------------- Teams triage helpers
+
+const TEAMS_DEFAULT_LOOKBACK_MS = 24 * 60 * 60_000;
+const TEAMS_WATERMARK_OVERLAP_MS = 60 * 60_000;
+
+export function buildTeamsTriageV2Window(currentWatermarkIso = null, now = new Date()) {
+  const endMs = now.getTime();
+  if (!Number.isFinite(endMs)) throw new TriageError("invalid_window", "Teams triage requires a valid current time");
+  let startMs = endMs - TEAMS_DEFAULT_LOOKBACK_MS;
+  if (currentWatermarkIso !== null) {
+    const parsed = Date.parse(currentWatermarkIso);
+    if (!Number.isFinite(parsed)) throw new TriageError("invalid_window", `Teams triage received an invalid watermark: ${currentWatermarkIso}`);
+    if (parsed >= endMs) throw new TriageError("invalid_window", "Teams triage watermark must be earlier than the current time");
+    startMs = parsed - TEAMS_WATERMARK_OVERLAP_MS;
+  }
+  return { startIso: new Date(startMs).toISOString(), endIso: new Date(endMs).toISOString() };
+}
+
+export function isOwnMessage(message) {
+  const address = clean(message?.senderAddress ?? message?.from?.user?.userPrincipalName).toLowerCase();
+  const name = clean(message?.senderName ?? previewSender(message?.from));
+  return (address && matchers.address.test(address)) || (name !== "" && matchers.self.test(name));
+}
+
+export function isLowSignal(text) {
+  const normalized = String(text ?? "")
+    .toLowerCase()
+    .replace(/[.!?,;:()[\]{}'"`~*_]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized || !/[a-z0-9]/i.test(normalized)) return true;
+  if (/^(?:hi|hello|hey|morning|afternoon|evening)(?: all| team| everyone)?$/.test(normalized)) return true;
+  if (/^(?:ok|okay|sure|great|nice|cool|done|noted|ack|thanks|thank you|thx|sounds good|will do|got it|no worries|welcome|youre welcome)$/.test(normalized)) {
+    return true;
+  }
+  return (
+    /^(?:liked|loved|laughed at|emphasized) a message$/.test(normalized) ||
+    /^(?:joined|left|was added to|was removed from) the chat$/.test(normalized)
+  );
+}
+
+export function mentionsUser(message) {
+  return (Array.isArray(message?.mentions) ? message.mentions : []).some((mention) => {
+    const text = typeof mention === "string"
+      ? mention
+      : `${mention?.mentionText ?? ""} ${mention?.mentioned?.user?.displayName ?? ""} ${mention?.mentioned?.user?.userPrincipalName ?? ""}`;
+    return matchers.name.test(text) || matchers.address.test(clean(text).toLowerCase());
+  });
+}
+
+export function classifyAction(text, directMention = false) {
+  const body = String(text ?? "");
+  const lower = body.toLowerCase();
+  const question =
+    body.includes("?") ||
+    /\b(?:can|could|would|will|do|did|are|is|have|has)\s+you\b/i.test(body) ||
+    /^(?:what|when|where|why|how|which|who)\b/i.test(body);
+  const actionRequest =
+    /\b(?:please|action required|need you to|could you|can you|would you|will you|follow up|take a look|review|approve|confirm|send|share|provide|update|complete|prepare|schedule|investigate|check|respond|reply|advise|let me know)\b/i
+      .test(body);
+  if (!directMention && !question && !actionRequest) return null;
+
+  if (question) {
+    let classification = "response_required:general";
+    if (/\b(?:price|pricing|cost|license|licensing|commercial|quote)\b/.test(lower)) {
+      classification = "response_required:pricing";
+    } else if (/\b(?:architecture|solution design|design review|proof of concept|poc)\b/.test(lower)) {
+      classification = "response_required:solution_design";
+    } else if (/\b(?:azure|api|sdk|deploy|deployment|integration|technical|feature|capability|error|issue)\b/.test(lower)) {
+      classification = "response_required:technical";
+    }
+    return {
+      classification,
+      impact: directMention
+        ? "You were directly mentioned in a Teams question that needs a response."
+        : "A Teams question was directed to you and needs a response.",
+    };
+  }
+  return {
+    classification: "follow_up_required",
+    impact:
+      directMention && actionRequest
+        ? "You were directly mentioned with an explicit Teams action request."
+        : directMention
+          ? "You were directly mentioned in Teams and should review the message."
+          : "The Teams message contains an explicit action request.",
+  };
+}
+
+// --------------------------------------------------------- Mail and calendar sync
+
+const syncText = (value) => (typeof value === "string" ? value : "");
+const syncNullable = (value) => syncText(value).trim() || null;
+const syncRecord = (value) => (value && typeof value === "object" ? value : null);
+
+function syncAddress(value) {
+  const outer = syncRecord(value);
+  if (!outer) return { name: "", address: "" };
+  const inner = syncRecord(outer.emailAddress) ?? outer;
+  return { name: syncText(inner.name), address: syncText(inner.address) };
+}
+
+const syncAddresses = (value) =>
+  Array.isArray(value) ? value.map((entry) => syncAddress(entry).address).filter(Boolean) : [];
+
+function syncDateTime(value) {
+  if (typeof value === "string") return { dateTime: value, timeZone: null };
+  const record = syncRecord(value);
+  return { dateTime: syncText(record?.dateTime).trim(), timeZone: syncNullable(record?.timeZone) };
+}
+
+export function mailItemKind(value) {
+  const type = syncText(value).toLowerCase();
+  if (type.endsWith("eventmessagerequest")) return "meetingRequest";
+  if (type.endsWith("eventmessagecancellation")) return "meetingCancellation";
+  if (type.endsWith("eventmessageresponse")) return "meetingResponse";
+  return "email";
+}
+
+export function meetingMessageDetails(record, kind) {
+  if (kind === "email") return null;
+  const start = syncDateTime(record.startDateTime);
+  const end = syncDateTime(record.endDateTime);
+  const event = syncRecord(record.event);
+  const location = syncRecord(record.location);
+  const flag = (value) => (typeof value === "boolean" ? value : null);
+  return {
+    meetingMessageType: syncNullable(record.meetingMessageType),
+    meetingRequestType: syncNullable(record.meetingRequestType),
+    iCalUId: syncNullable(record.iCalUId ?? record.globalAppointmentId ?? record.GlobalAppointmentID ?? event?.iCalUId),
+    startAt: start.dateTime ? graphDateTimeToUtcIso(start.dateTime, start.timeZone) : null,
+    endAt: end.dateTime ? graphDateTimeToUtcIso(end.dateTime, end.timeZone) : null,
+    timeZone: start.timeZone ?? end.timeZone,
+    location: syncNullable(location?.displayName),
+    isAllDay: flag(record.isAllDay),
+    isOutOfDate: flag(record.isOutOfDate),
+    responseRequested: flag(record.responseRequested),
+    allowNewTimeProposals: flag(record.allowNewTimeProposals),
+  };
+}
+
+export function normalizeMailMessage(value) {
+  const record = syncRecord(value);
+  if (!record) return null;
+  const id = syncText(record.id);
+  const receivedAt = syncText(record.receivedDateTime);
+  if (!id || !receivedAt) return null;
+  const sender = syncAddress(record.from);
+  const body = syncRecord(record.body);
+  const toRecipients = syncAddresses(record.toRecipients);
+  const ccRecipients = syncAddresses(record.ccRecipients);
+  const kind = mailItemKind(record["@odata.type"]);
+  return {
+    id,
+    mailItemKind: kind,
+    meetingDetails: meetingMessageDetails(record, kind),
+    conversationId: syncNullable(record.conversationId),
+    receivedAt,
+    lastModifiedAt: syncNullable(record.lastModifiedDateTime),
+    senderName: sender.name,
+    senderAddress: sender.address,
+    recipients: [...toRecipients, ...ccRecipients],
+    toRecipients,
+    ccRecipients,
+    subject: syncText(record.subject),
+    bodyPreview: syncText(record.bodyPreview),
+    bodyContent: syncText(body?.content),
+    bodyContentType: syncNullable(body?.contentType),
+    isRead: record.isRead === true,
+    importance: syncText(record.importance) || "normal",
+    webLink: sanitizeOutlookDeepLink(syncNullable(record.webLink)),
+    removed: record["@removed"] !== undefined,
+    processingState: "pending",
+  };
+}
+
+function singleGraphPayload(payload, label) {
+  const result = extractWorkIqEntityResults(payload)[0];
+  if (!result || result.statusCode < 200 || result.statusCode >= 300) {
+    throw new TriageError("m365_error", `WorkIQ ${label} read failed with status ${result?.statusCode ?? "unknown"}`);
+  }
+  return result.data;
+}
+
+function payloadMessages(payload) {
+  const values = Array.isArray(payload.value) ? payload.value : [payload];
+  return values.flatMap((value) => normalizeMailMessage(value) ?? []);
+}
+
+async function fetchWindowPage(workiq, window, includeBodyPreview = false) {
+  const filter = encodeURIComponent(`receivedDateTime ge ${window.startIso} and receivedDateTime lt ${window.endIso}`);
+  const fields = includeBodyPreview ? `${MAIL_FIELDS},bodyPreview` : MAIL_FIELDS;
+  const path =
+    `/me/mailFolders/inbox/messages?$select=${fields}` +
+    `&$filter=${filter}&$orderby=receivedDateTime%20asc&$top=${MAIL_PAGE_SIZE}`;
+  const payload = singleGraphPayload(await workiq.fetch([path]), "mail");
+  return { messages: payloadMessages(payload), truncated: Boolean(syncNullable(payload["@odata.nextLink"])) };
+}
+
+// WorkIQ rejects the $skip continuation in @odata.nextLink, so an oversized window is halved until its earliest prefix fits one page.
+export async function readEmailWindowSlice(workiq, window, unreadOnly = false) {
+  const startMs = Date.parse(window?.startIso);
+  let endMs = Date.parse(window?.endIso);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs >= endMs) {
+    throw new TriageError("invalid_window", "WorkIQ Inbox read requires a valid bounded time window");
+  }
+  const requestedEndMs = endMs;
+  for (let split = 0; split <= MAIL_MAX_WINDOW_SPLITS; split += 1) {
+    const completedEndIso = new Date(endMs).toISOString();
+    const page = await fetchWindowPage(workiq, { startIso: new Date(startMs).toISOString(), endIso: completedEndIso });
+    if (!page.truncated) {
+      return {
+        messages: page.messages
+          .filter((message) => !message.removed && (!unreadOnly || !message.isRead))
+          .sort((a, b) => b.receivedAt.localeCompare(a.receivedAt)),
+        completedEndIso,
+        hasMore: endMs < requestedEndMs,
+      };
+    }
+    const midpointMs = startMs + Math.floor((endMs - startMs) / 2);
+    if (midpointMs <= startMs) break;
+    endMs = midpointMs;
+  }
+  throw new TriageError("m365_error", "WorkIQ Inbox volume exceeded the minimum bounded time slice");
+}
+
+export async function readEmailWindow(workiq, window, unreadOnly = false) {
+  return (await readEmailWindowSlice(workiq, window, unreadOnly)).messages;
+}
+
+export async function fetchEmailDetail(workiq, messageId, expectedKind = "email") {
+  const basePath = `/me/messages/${encodeURIComponent(messageId)}`;
+  // WorkIQ rejects derived meeting fields in a base-message $select, so meeting artifacts are read unprojected.
+  const path = expectedKind === "email" ? `${basePath}?$select=${MAIL_DETAIL_FIELDS}` : basePath;
+  let message = payloadMessages(singleGraphPayload(await workiq.fetch([path]), "mail"))[0];
+  if (expectedKind === "email" && message && message.mailItemKind !== "email" && !message.meetingDetails?.startAt) {
+    message = payloadMessages(singleGraphPayload(await workiq.fetch([basePath]), "mail"))[0];
+  }
+  if (!message) throw new TriageError("workiq_invalid_result", "WorkIQ returned no email details for the selected message");
+  return message;
+}
+
+export function normalizeCalendarEvent(value) {
+  const event = syncRecord(value);
+  if (!event) return null;
+  const id = syncText(event.id);
+  const start = syncDateTime(event.start);
+  const end = syncDateTime(event.end);
+  if (!id || !start.dateTime || !end.dateTime) return null;
+  const organizer = syncAddress(event.organizer ?? event.organiser);
+  const location = syncRecord(event.location);
+  const body = syncRecord(event.body);
+  const onlineMeeting = syncRecord(event.onlineMeeting);
+  return {
+    id,
+    iCalUId: syncNullable(event.iCalUId),
+    startAt: graphDateTimeToUtcIso(start.dateTime, start.timeZone),
+    endAt: graphDateTimeToUtcIso(end.dateTime, end.timeZone),
+    timeZone: start.timeZone ?? end.timeZone,
+    lastModifiedAt: syncNullable(event.lastModifiedDateTime),
+    organiserName: organizer.name,
+    organiserAddress: organizer.address,
+    attendees: syncAddresses(event.attendees),
+    subject: syncText(event.subject),
+    bodyPreview: syncText(event.bodyPreview),
+    bodyContent: syncText(body?.content),
+    bodyContentType: syncNullable(body?.contentType),
+    location: syncText(location?.displayName) || syncText(event.location),
+    onlineMeetingUrl: syncNullable(onlineMeeting?.joinUrl) ?? syncNullable(event.onlineMeetingUrl),
+    webLink: sanitizeOutlookDeepLink(syncNullable(event.webLink)),
+    isCancelled: event.isCancelled === true,
+    removed: event["@removed"] !== undefined,
+    processingState: "pending",
+  };
+}
+
+function payloadEvents(payload) {
+  const values = Array.isArray(payload.value) ? payload.value : [payload];
+  return values.flatMap((value) => normalizeCalendarEvent(value) ?? []);
+}
+
+export function relativeGraphPath(value) {
+  if (value.startsWith("/")) return value.replace(/^\/v1\.0/, "");
+  const url = new URL(value);
+  return `${url.pathname.replace(/^\/v1\.0/, "")}${url.search}`;
+}
+
+export async function syncCalendarWindow(workiq, window) {
+  const params = new URLSearchParams({
+    startDateTime: window.startIso,
+    endDateTime: window.endIso,
+    $select: CALENDAR_FIELDS,
+  });
+  let path = `/me/calendarView?${params.toString()}`;
+  const events = [];
+  let pageCount = 0;
+  while (path && pageCount < CALENDAR_MAX_PAGES) {
+    pageCount += 1;
+    const payload = singleGraphPayload(await workiq.fetch([relativeGraphPath(path)]), "calendar");
+    events.push(...payloadEvents(payload));
+    path = syncNullable(payload["@odata.nextLink"]) ?? "";
+  }
+  if (path) throw new TriageError("m365_error", "WorkIQ calendar view exceeded the bounded page limit");
+  return events;
+}
+
+export async function fetchCalendarEventDetail(workiq, eventId) {
+  const path = `/me/events/${encodeURIComponent(eventId)}?$select=${CALENDAR_DETAIL_FIELDS}`;
+  const event = payloadEvents(singleGraphPayload(await workiq.fetch([path]), "calendar"))[0];
+  if (!event) throw new TriageError("workiq_invalid_result", "WorkIQ returned no calendar details for the selected event");
+  return event;
+}
+
+// Fallback thread built from the chat preview so a Teams item always opens with its latest message.
+function previewThreadMessage(item) {
+  const body = String(item.summary ?? "").trim();
+  if (!body) return null;
+  const from = item.sender || "Teams message";
+  return {
+    id: `preview-${item.id}`,
+    from,
+    sender: from,
+    senderId: "",
+    createdDateTime: item.receivedAt ?? null,
+    body,
+    blocks: extractEmailBlocks({ contentType: "text", content: body }, ""),
+    replyTo: [],
+    attachments: [],
+    reactions: [],
+    isMe: matchers.self.test(from),
   };
 }
 
@@ -1599,7 +2209,7 @@ export function openUrlFor(item, target = "native") {
     return `ms-outlook://emails/message/${outlookId}?account=${encodeURIComponent(activeIdentity.email)}`;
   }
   return (
-    item.webLink ||
+    sanitizeOutlookDeepLink(item.webLink) ||
     `https://outlook.office365.com/owa/?ItemID=${encodeURIComponent(id)}&exvsurl=1&viewmodel=ReadMessageItem`
   );
 }
@@ -1692,7 +2302,7 @@ export function normalizeAgendaEvent(raw) {
     responseStatus: normalizeResponseLabel(raw.responseStatus?.response),
     isOnline: Boolean(joinUrl),
     joinUrl,
-    webLink: safeLink(raw.webLink),
+    webLink: sanitizeOutlookDeepLink(safeLink(raw.webLink)),
     conflictsWith: [],
   };
 }
@@ -2338,53 +2948,68 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
     return changed;
   }
 
-  async function teamsDetail(item) {
-    const messagePayload = await workiq.fetch([`/chats/${item.rawId}/messages?$top=20`]);
-    const messagesData = workIqFetchData(messagePayload, 0, `chat messages ${item.rawId}`);
-    const messages = (messagesData?.value ?? [])
-      .filter((message) => !/^systemEventMessage$/i.test(message?.messageType ?? ""))
+  // Turns raw Graph messages into the persisted thread (newest PERSISTED_MESSAGE_LIMIT, oldest first) and its participants.
+  function buildChatThread(values) {
+    const visible = values
+      .filter((message) => !isDeletedOrSystemMessage(message))
+      .sort((a, b) => messageTime(b).localeCompare(messageTime(a)));
+    const messages = visible
+      .slice(0, PERSISTED_MESSAGE_LIMIT)
       .map((message) => normalizeTeamsDetailMessage(message, currentUserId))
       .filter((message) => message.body || message.replyTo.length || message.attachments.length)
-      .sort((a, b) => String(a.createdDateTime ?? "").localeCompare(String(b.createdDateTime ?? "")));
-    const latest = resolveChatPreview(
-      [...(messagesData?.value ?? [])].sort((a, b) => String(b?.createdDateTime ?? "").localeCompare(String(a?.createdDateTime ?? ""))),
-    );
-    if (latest && syncChatRow(item, latest)) await commit();
-    const cachedMembers = chatMembersCache.get(item.rawId);
-    let members = (messagesData?.value ?? []).length > 2
-      ? dedupePeople(
-          (messagesData?.value ?? [])
-            .map((message) => message?.from?.user)
-            .filter(Boolean)
-            .map(normalizeMember),
-        )
-      : cachedMembers && cachedMembers.expiresAt > Date.now()
-        ? cachedMembers.value
-        : null;
-    if (!members) {
-      try {
-        const memberPayload = await workiq.fetch([`/chats/${item.rawId}/members`]);
-        members = dedupePeople(
-          (workIqFetchData(memberPayload, 0, `chat members ${item.rawId}`)?.value ?? []).map(normalizeMember),
-        );
-        chatMembersCache.set(item.rawId, { value: members, expiresAt: Date.now() + MEMBERS_TTL_MS });
-      } catch {
-        members = [];
+      .sort((a, b) => messageTime(a).localeCompare(messageTime(b)));
+    const members = dedupePeople(visible.map((message) => message?.from?.user).filter(Boolean).map(normalizeMember));
+    return { messages, members, latest: resolveChatPreview(visible) };
+  }
+
+  const storedThread = (item) => ({
+    id: item.id,
+    source: "teams",
+    item: { ...item },
+    members: item.members ?? [],
+    messages: item.messages,
+  });
+
+  // A chat opens from its persisted thread; WorkIQ is only read when no thread is stored or a refresh is forced.
+  async function teamsDetail(item, { forceRefresh = false } = {}) {
+    if (!forceRefresh && Array.isArray(item.messages) && item.messages.length > 0) return storedThread(item);
+    let outcome = null;
+    let failure = null;
+    try {
+      const fetchBatch = workiq.fetchPartial ?? workiq.fetch;
+      const payload = await fetchBatch.call(workiq, [messagePath(item.rawId)], { tolerateEntityErrors: true });
+      [outcome] = extractWorkIqEntityOutcomes(payload);
+    } catch (error) {
+      failure = error;
+    }
+    if (outcome && outcome.statusCode >= 200 && outcome.statusCode < 300 && outcome.data) {
+      const thread = buildChatThread(Array.isArray(outcome.data.value) ? outcome.data.value : []);
+      if (thread.messages.length) {
+        if (thread.latest) syncChatRow(item, thread.latest);
+        item.messages = thread.messages;
+        item.members = thread.members;
+        await commit();
+        return storedThread(item);
       }
     }
-    return { id: item.id, source: "teams", item: { ...item }, members, messages };
+    if (Array.isArray(item.messages) && item.messages.length > 0) return storedThread(item);
+    const fallback = previewThreadMessage(item);
+    if (!fallback) {
+      throw failure ?? new TriageError("m365_error", `chat messages ${item.rawId}: WorkIQ returned no messages`);
+    }
+    return { id: item.id, source: "teams", item: { ...item }, members: [], messages: [fallback] };
   }
 
   async function emailDetail(item) {
     const select =
       "id,subject,body,uniqueBody,bodyPreview,from,sender,toRecipients,ccRecipients,replyTo," +
       "receivedDateTime,sentDateTime,conversationId,importance,hasAttachments,webLink,flag";
-    const payload = await workiq.fetch([`/me/messages/${item.rawId}?$select=${select}`]);
+    const payload = await workiq.fetch([`/me/messages/${encodeURIComponent(item.rawId)}?$select=${select}`]);
     const message = workIqFetchData(payload, 0, `email ${item.rawId}`);
     let attachments = [];
     if (message.hasAttachments) {
       const [attachmentOutcome] = await Promise.allSettled([
-        workiq.fetch([`/me/messages/${item.rawId}/attachments?$select=id,name,contentType,size,isInline`]),
+        workiq.fetch([`/me/messages/${encodeURIComponent(item.rawId)}/attachments?$select=id,name,contentType,size,isInline`]),
       ]);
       if (attachmentOutcome.status === "fulfilled") {
         try {
@@ -2467,7 +3092,10 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
       }
       return { events, coverage: "complete" };
     } catch {
-      if (cachedCovers) return { events: state.calendarEvents, coverage: "cached" };
+      // A WorkIQ error or rate-limit cooldown falls back to the loaded agenda instead of failing the detail view.
+      if (cachedCovers || (state.agendaLoaded && state.calendarEvents.some(overlapsDay))) {
+        return { events: state.calendarEvents, coverage: "cached" };
+      }
       return { events: [], coverage: "unavailable" };
     }
   }
@@ -2504,7 +3132,7 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
     let message = null;
     let expandError = null;
     try {
-      const payload = await workiq.fetch([`/me/messages/${item.rawId}?$select=${select}&$expand=${expand}`]);
+      const payload = await workiq.fetch([`/me/messages/${encodeURIComponent(item.rawId)}?$select=${select}&$expand=${expand}`]);
       message = workIqFetchData(payload, 0, `calendar invite ${item.rawId}`);
     } catch (error) {
       if (!(error instanceof WorkIqError || (error instanceof TriageError && error.code === "m365_error"))) throw error;
@@ -2513,7 +3141,7 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
     if (!message?.event) {
       // A canceled occurrence is deleted from the calendar store, so only the bare message resolves.
       try {
-        const payload = await workiq.fetch([`/me/messages/${item.rawId}`]);
+        const payload = await workiq.fetch([`/me/messages/${encodeURIComponent(item.rawId)}`]);
         message = workIqFetchData(payload, 0, `calendar invite ${item.rawId}`);
       } catch (error) {
         if (!message) throw error;
@@ -2618,7 +3246,7 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
     };
   }
 
-  async function getDetail(id) {
+  async function getDetail(id, { forceRefresh = false } = {}) {
     return mutate(async () => {
       await load();
       const item = state.items.find((entry) => entry.id === id);
@@ -2626,12 +3254,12 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
       const seeded = syntheticDetail(item);
       if (seeded) return { ...seeded, cached: null, warning: null };
       const cacheKey = `${item.id}:${item.receivedAt ?? ""}`;
-      const hit = detailCache.get(cacheKey);
+      const hit = forceRefresh ? null : detailCache.get(cacheKey);
       if (hit && hit.expiresAt > Date.now()) return hit.value;
       try {
         let detail;
         if (item.source === "teams") {
-          detail = await teamsDetail(item);
+          detail = await teamsDetail(item, { forceRefresh });
         } else if (item.source === "calendar") {
           const previousEventId = item.eventId;
           const wasCancelled = Boolean(item.isCancelled);
@@ -2719,10 +3347,47 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
     return records;
   }
 
-  async function fetchEmails() {
+  // Walks the unread Inbox newest-first. WorkIQ rejects the $skip in @odata.nextLink, so each further page is a
+  // fresh `receivedDateTime le <oldest seen>` query instead of a continuation link.
+  async function fetchUnreadInbox() {
     const select = "id,subject,from,toRecipients,ccRecipients,receivedDateTime,bodyPreview,webLink,importance,inferenceClassification";
-    const base = `/me/mailFolders/inbox/messages?$filter=isRead%20eq%20false&$select=${select}&$orderby=receivedDateTime%20desc&$top=${PAGE_SIZE}`;
-    const messages = await fetchAllPages(base, MAX_EMAIL_PAGES, "email");
+    const query = (filter) =>
+      `/me/mailFolders/inbox/messages?$filter=${encodeURIComponent(filter)}&$select=${select}` +
+      `&$orderby=receivedDateTime%20desc&$top=${PAGE_SIZE}`;
+    const records = [];
+    const seen = new Set();
+    let path = query("isRead eq false");
+    for (let page = 0; path && page < MAX_EMAIL_PAGES; page++) {
+      let data;
+      try {
+        data = workIqFetchData(await workiq.fetch([path]), 0, `email page ${page + 1}`);
+      } catch (error) {
+        if (page === 0) throw error;
+        break;
+      }
+      const values = Array.isArray(data?.value) ? data.value : [];
+      let added = 0;
+      for (const record of values) {
+        if (record?.id !== undefined) {
+          if (seen.has(record.id)) continue;
+          seen.add(record.id);
+        }
+        records.push(record);
+        added++;
+      }
+      const oldest = values
+        .map((record) => String(record?.receivedDateTime ?? ""))
+        .filter(Boolean)
+        .sort()[0];
+      path = data?.["@odata.nextLink"] && oldest && added > 0
+        ? query(`receivedDateTime le ${oldest} and isRead eq false`)
+        : null;
+    }
+    return records;
+  }
+
+  async function fetchEmails() {
+    const messages = await fetchUnreadInbox();
     const items = [];
     for (const message of messages) {
       const item = classifyCalendar(message) ?? classifyEmail(message);
@@ -2731,42 +3396,23 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
     return { items, scanned: messages.length };
   }
 
-  async function resolvePreviewBatch(batch) {
-    const fetchPreviews = workiq.fetchPartial ?? workiq.fetch;
-    let timer;
-    const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error("preview lookup timed out")), PREVIEW_TIMEOUT_MS);
-    });
-    const lookup = Promise.resolve(
-      fetchPreviews.call(
-        workiq,
-        batch.map((chat) => `/chats/${chat.id}/messages?$top=6`),
-      ),
-    );
-    lookup.catch(() => {});
-    try {
-      return await Promise.race([lookup, timeout]);
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
   async function fetchChats() {
-    const base =
-      `/me/chats?$select=id,chatType,topic,tenantId,viewpoint` +
-      `&$expand=lastMessagePreview&$top=${PAGE_SIZE}`;
-    const chats = await fetchAllPages(base, MAX_CHAT_PAGES, "chat");
+    const { unread, fetched } = await fetchCandidateChats(workiq, { currentUserId });
 
     const priorByRawId = new Map(
       (state?.items ?? [])
-        .filter((item) => item.source === "teams" && item.rawId && item.summary && item.summary !== "Unread message in Teams")
+        .filter((item) => item.source === "teams" && item.rawId)
         .map((item) => [item.rawId, item]),
     );
-    const unread = chats.map(normalizeWorkIqChat).filter((chat) => chat.hasUnreadMessages);
     for (const chat of unread) {
       if (!needsPreviewResolution(chat)) continue;
       const prior = priorByRawId.get(chat.id);
-      if (prior && prior.receivedAt && prior.receivedAt === chat.lastMessagePreview?.createdDateTime) {
+      if (
+        prior?.summary &&
+        prior.summary !== "Unread message in Teams" &&
+        prior.receivedAt &&
+        prior.receivedAt === chat.lastMessagePreview?.createdDateTime
+      ) {
         chat.lastMessagePreview = {
           ...(chat.lastMessagePreview ?? {}),
           body: prior.summary,
@@ -2774,43 +3420,55 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
         };
       }
     }
-    const previewTime = (chat) =>
-      Date.parse(chat?.lastMessagePreview?.createdDateTime || chat?.lastUpdatedDateTime || "") || 0;
-    const unresolved = unread
-      .filter(needsPreviewResolution)
-      .sort((a, b) => previewTime(b) - previewTime(a))
-      .slice(0, MAX_PREVIEW_ENRICH);
-    for (
-      let offset = 0;
-      chats.length <= PAGE_SIZE && offset < unresolved.length;
-      offset += PREVIEW_BATCH_SIZE
-    ) {
-      const batch = unresolved.slice(offset, offset + PREVIEW_BATCH_SIZE);
-      let previews;
-      try {
-        previews = await resolvePreviewBatch(batch);
-      } catch {
-        continue;
-      }
-      const outcomes = extractWorkIqEntityOutcomes(previews);
-      for (const [index, chat] of batch.entries()) {
-        const outcome = outcomes[index];
-        if (!outcome || outcome.statusCode < 200 || outcome.statusCode >= 300 || !outcome.data) {
-          continue;
-        }
-        const messages = Array.isArray(outcome.data.value) ? outcome.data.value : [];
-        const resolved = resolveChatPreview(messages);
-        if (!resolved) continue;
+
+    const toFetch = unread.filter((chat) => {
+      if (needsPreviewResolution(chat)) return true;
+      const prior = priorByRawId.get(chat.id);
+      if (!Array.isArray(prior?.messages) || prior.messages.length === 0) return true;
+      return !prior.receivedAt || prior.receivedAt !== chat.lastMessagePreview?.createdDateTime;
+    });
+    const outcomes = await fetchRecentMessages(workiq, toFetch);
+    const threads = new Map();
+    for (const chat of unread) {
+      const outcome = outcomes.get(chat.id);
+      if (!outcome?.ok) continue;
+      const thread = buildChatThread(outcome.values);
+      if (!thread.messages.length) continue;
+      threads.set(chat.id, thread);
+      if (needsPreviewResolution(chat) && thread.latest) {
         chat.lastMessagePreview = {
           ...(chat.lastMessagePreview ?? {}),
-          body: resolved.body,
-          from: resolved.from,
-          createdDateTime: resolved.createdDateTime ?? chat.lastMessagePreview?.createdDateTime ?? null,
+          body: thread.latest.body,
+          from: thread.latest.from,
+          createdDateTime: thread.latest.createdDateTime ?? chat.lastMessagePreview?.createdDateTime ?? null,
         };
         chat.hasUnreadMessages = true;
       }
     }
-    return { items: unread.map(classifyChat).filter(Boolean), scanned: chats.length };
+
+    const items = [];
+    for (const chat of unread) {
+      const item = classifyChat(chat);
+      if (!item) continue;
+      const thread = threads.get(chat.id);
+      const prior = priorByRawId.get(chat.id);
+      if (thread) {
+        item.messages = thread.messages;
+        item.members = thread.members;
+      } else {
+        // The batch failed or skipped this chat: keep the stored thread and add the newer preview when there is one.
+        const stored = Array.isArray(prior?.messages) ? prior.messages : [];
+        const preview = previewThreadMessage(item);
+        const lastStored = stored.at(-1);
+        const previewIsNewer =
+          preview && (!lastStored || messageTime(preview) > messageTime(lastStored)) && preview.body !== lastStored?.body;
+        const merged = previewIsNewer ? [...stored, preview] : stored;
+        if (merged.length) item.messages = merged.slice(-PERSISTED_MESSAGE_LIMIT);
+        if (prior?.members?.length) item.members = prior.members;
+      }
+      items.push(item);
+    }
+    return { items, scanned: fetched };
   }
 
   async function refreshIdentity() {
@@ -3798,7 +4456,7 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
         sendJson(res, 400, { error: "Unsupported bridge method" });
         return;
       }
-      if (url.pathname === "/api/detail") return sendJson(res, 200, await getDetail(String(body.id)));
+      if (url.pathname === "/api/detail") return sendJson(res, 200, await getDetail(String(body.id), { forceRefresh: body.forceRefresh === true }));
       if (url.pathname === "/api/refresh") return sendJson(res, 200, await refresh());
       if (url.pathname === "/api/agenda") return sendJson(res, 200, await refreshAgenda());
       if (url.pathname === "/api/intel") return sendJson(res, 200, await getItemIntel(body));
