@@ -195,12 +195,42 @@ export function stripText(value, max = 360) {
       .replace(/<script[\s\S]*?<\/script>/gi, " ")
       .replace(/<[^>]*>/g, " "),
   )
+    .replace(/\{\{DATE\(([^,)]+)(?:,[^)]*)?\)\}\}/gi, (_m, iso) => {
+      const d = new Date(String(iso).trim());
+      return Number.isNaN(d.getTime())
+        ? String(iso).trim()
+        : d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" });
+    })
+    .replace(/\{\{TIME\(([^)]+)\)\}\}/gi, (_m, iso) => {
+      const d = new Date(String(iso).trim());
+      return Number.isNaN(d.getTime())
+        ? String(iso).trim()
+        : d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "UTC" });
+    })
     .replace(/&nbsp;|\u00a0/g, " ")
     .replace(/\[([^\]\n]{1,200})\]\((?:https?:\/\/|mailto:)[^)\s]*\)/gi, "$1")
     .replace(/\*\*([^*\n]+)\*\*/g, "$1")
     .replace(/\s+/g, " ")
     .trim();
   return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
+}
+
+function normalizeMailMcpMessage(raw, fallbackSender = "") {
+  const data = raw?.data && typeof raw.data === "object" ? raw.data : raw;
+  const recipients = (list) =>
+    Array.isArray(list)
+      ? list.map((entry) => (typeof entry === "string" ? { emailAddress: { name: entry, address: entry } } : entry))
+      : list;
+  const normalized = { ...data };
+  if (typeof data?.body === "string") {
+    normalized.body = { contentType: /^\s*</.test(data.body) ? "html" : "text", content: data.body };
+  }
+  if (typeof data?.from === "string") {
+    normalized.from = { emailAddress: { name: fallbackSender || data.from, address: data.from } };
+  }
+  normalized.toRecipients = recipients(data?.toRecipients);
+  normalized.ccRecipients = recipients(data?.ccRecipients);
+  return normalized;
 }
 
 function parseAttachmentJson(attachment) {
@@ -1448,7 +1478,7 @@ export function normalizeTeamsDetailMessage(
   const reactionCounts = new Map();
   for (const reaction of Array.isArray(message?.reactions) ? message.reactions : []) {
     const type = String(reaction?.reactionType ?? "").trim();
-    if (type) reactionCounts.set(type, (reactionCounts.get(type) ?? 0) + 1);
+    if (type && !/^custom$/i.test(type)) reactionCounts.set(type, (reactionCounts.get(type) ?? 0) + 1);
   }
   const reactions = [...reactionCounts].map(([type, count]) => ({ type, count }));
   if (!blocks.length && !replyTo.length && attachments.some((att) => att.contentType === "image")) {
@@ -2917,11 +2947,15 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
   }
 
   const person = (recipient) => {
+    if (typeof recipient === "string") {
+      const address = recipient.trim();
+      return { name: address, address, email: address };
+    }
     const emailAddress = recipient?.emailAddress ?? recipient;
     const name = String(emailAddress?.name ?? recipient?.name ?? recipient?.displayName ?? "").trim();
     const address = String(emailAddress?.address ?? recipient?.address ?? recipient?.email ?? "").trim();
     return {
-      name,
+      name: name || address,
       address,
       email: address,
     };
@@ -3212,22 +3246,7 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
       }));
     let message;
     let attachments = [];
-    if (await canUseServerTool(workiq, "mail", "GetMessage")) {
-      message = await workiq.mailGetMessage({ id: item.rawId, preferHtml: true });
-      if (!message || typeof message !== "object" || Array.isArray(message)) {
-        throw new TriageError("workiq_invalid_result", `email ${item.rawId}: mail server returned no message`);
-      }
-      if (message.hasAttachments && (await canUseServerTool(workiq, "mail", "GetAttachments"))) {
-        try {
-          const res = await workiq.mailGetAttachments({ id: item.rawId });
-          attachments = mapAttachments(
-            Array.isArray(res?.value) ? res.value : Array.isArray(res?.attachments) ? res.attachments : [],
-          );
-        } catch {
-          attachments = [];
-        }
-      }
-    } else {
+    try {
       const payload = await workiq.fetch([`/me/messages/${encodeURIComponent(item.rawId)}?$select=${select}`]);
       message = workIqFetchData(payload, 0, `email ${item.rawId}`);
       if (message.hasAttachments) {
@@ -3242,6 +3261,23 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
           } catch {
             attachments = [];
           }
+        }
+      }
+    } catch (error) {
+      if (!(await canUseServerTool(workiq, "mail", "GetMessage"))) throw error;
+      const raw = await workiq.mailGetMessage({ id: item.rawId, preferHtml: true });
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+        throw new TriageError("workiq_invalid_result", `email ${item.rawId}: mail server returned no message`);
+      }
+      message = normalizeMailMcpMessage(raw, item.sender);
+      attachments = [];
+      if (message.hasAttachments && (await canUseServerTool(workiq, "mail", "GetAttachments"))) {
+        try {
+          const attRes = await workiq.mailGetAttachments({ id: item.rawId });
+          const list = attRes?.data ?? attRes?.value ?? attRes?.attachments ?? [];
+          attachments = mapAttachments(Array.isArray(list) ? list : []);
+        } catch {
+          attachments = [];
         }
       }
     }
@@ -3570,11 +3606,18 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
   // fresh `receivedDateTime le <oldest seen>` query instead of a continuation link.
   async function fetchUnreadInbox() {
     const select = "id,subject,from,toRecipients,ccRecipients,receivedDateTime,bodyPreview,webLink,importance,inferenceClassification";
-    if (await canUseServerTool(workiq, "mail", "SearchMessagesQueryParameters")) {
+    try {
+      return await fetchUnreadInboxViaGraph(select);
+    } catch (error) {
+      if (!(await canUseServerTool(workiq, "mail", "SearchMessagesQueryParameters"))) throw error;
+    }
+    {
+      // The mail MCP caps responses at 51,200 bytes, so omit recipient arrays and use a small page size.
+      const mcpSelect = "id,subject,from,receivedDateTime,bodyPreview,webLink,importance,inferenceClassification";
       // $filter combined with $orderby fails with InefficientFilter, so sort client-side.
       const collected = [];
       const seenIds = new Set();
-      let args = { queryParameters: `?$filter=isRead eq false&$select=${select}&$top=${PAGE_SIZE}` };
+      let args = { queryParameters: `?$filter=isRead eq false&$select=${mcpSelect}&$top=15` };
       for (let page = 0; args && page < MAX_EMAIL_PAGES; page++) {
         let data;
         try {
@@ -3595,6 +3638,9 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
       }
       return collected.sort((a, b) => String(b.receivedDateTime ?? "").localeCompare(String(a.receivedDateTime ?? "")));
     }
+  }
+
+  async function fetchUnreadInboxViaGraph(select) {
     const query = (filter) =>
       `/me/mailFolders/inbox/messages?$filter=${encodeURIComponent(filter)}&$select=${select}` +
       `&$orderby=receivedDateTime%20desc&$top=${PAGE_SIZE}`;

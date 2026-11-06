@@ -4292,6 +4292,7 @@ test("mail and teams actions use the dedicated MCP servers when exposed", async 
     teamsUpdateChat: async (args) => calls.push(["updateChat", args]),
     fetch: async ([path]) => {
       calls.push(["fetch", path]);
+      if (path.includes("/mailFolders/inbox/") || path.startsWith("/me/messages/")) throw new Error("workiq mail unavailable");
       return path.startsWith("/me?") ? { results: [{ statusCode: 404, error: "unavailable" }] } : emptyInbox;
     },
     update: async (...args) => calls.push(["update", ...args]),
@@ -4305,7 +4306,8 @@ test("mail and teams actions use the dedicated MCP servers when exposed", async 
   const emails = result.items.filter((entry) => entry.source === "email");
   assert.deepEqual(emails.map((entry) => entry.rawId), ["m3", "m2", "m1"], "paged, deduplicated, and sorted newest first");
   const [firstSearch, secondSearch] = calls.filter((call) => call[0] === "search").map((call) => call[1]);
-  assert.match(firstSearch.queryParameters, /^\?\$filter=isRead eq false&\$select=.+&\$top=50$/);
+  assert.match(firstSearch.queryParameters, /^\?\$filter=isRead eq false&\$select=.+&\$top=15$/);
+  assert.ok(!/toRecipients|ccRecipients/.test(firstSearch.queryParameters));
   assert.ok(!firstSearch.queryParameters.includes("$orderby"));
   assert.deepEqual(secondSearch, { nextLink: "next-link" });
 
@@ -4341,4 +4343,135 @@ test("mail and teams actions use the dedicated MCP servers when exposed", async 
   await triage.dismiss(chat.id);
   assert.ok(calls.filter((call) => call[0] === "updateChat").every(([, args]) => args.chatId === "chat-9" && args.action === "markRead"));
   assert.ok(calls.filter((call) => call[0] === "updateChat").length >= 2, "reply and dismiss both mark the chat read");
+});
+
+test("inbox and email detail read through workiq.fetch first and never touch the mail MCP", async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "triage-mail-fetch-first-"));
+  t.after(() => rm(stateRoot, { recursive: true, force: true }));
+  const paths = [];
+  const workiq = {
+    hasServerTool: async (server) => server === "mail",
+    mailSearchMessages: async () => assert.fail("mail search must not run when workiq.fetch succeeds"),
+    mailGetMessage: async () => assert.fail("mail get must not run when workiq.fetch succeeds"),
+    fetch: async ([path]) => {
+      paths.push(path);
+      if (path.startsWith("/me?")) return { results: [{ statusCode: 404, error: "unavailable" }] };
+      if (path.startsWith("/me/mailFolders/inbox/messages")) {
+        return {
+          results: [{
+            statusCode: 200,
+            data: {
+              value: [{
+                id: "f1",
+                subject: "Fetch first",
+                receivedDateTime: "2026-01-15T10:00:00Z",
+                from: { emailAddress: { name: "Sample User", address: "sample@contoso.com" } },
+                bodyPreview: "Can you review?",
+              }],
+            },
+          }],
+        };
+      }
+      if (path.startsWith("/me/messages/f1")) {
+        return {
+          results: [{
+            statusCode: 200,
+            data: {
+              id: "f1",
+              subject: "Fetch first",
+              body: { contentType: "html", content: "<p>Full body</p>" },
+              from: { emailAddress: { name: "Sample User", address: "sample@contoso.com" } },
+              toRecipients: [{ emailAddress: { name: "Jordan Lee", address: "jordan.lee@fabrikam.com" } }],
+              ccRecipients: [],
+              receivedDateTime: "2026-01-15T10:00:00Z",
+            },
+          }],
+        };
+      }
+      return emptyInbox;
+    },
+    update: async () => ({}),
+    action: async () => ({}),
+  };
+  const triage = createTriage({ workiq, statePath: join(stateRoot, "state.json") });
+  const result = await triage.refresh();
+  const [email] = result.items.filter((entry) => entry.source === "email");
+  assert.equal(email.rawId, "f1");
+  assert.ok(paths.some((path) => path.startsWith("/me/mailFolders/inbox/messages") && path.includes("toRecipients,ccRecipients")));
+  const detail = await triage.getDetail(email.id);
+  assert.equal(detail.to[0].name, "Jordan Lee");
+  assert.match(detail.bodyText, /Full body/);
+});
+
+test("email detail falls back to the mail MCP and unwraps its flat message envelope", async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "triage-mail-mcp-detail-"));
+  t.after(() => rm(stateRoot, { recursive: true, force: true }));
+  const calls = [];
+  const workiq = {
+    hasServerTool: async (server, tool) => server === "mail" && ["SearchMessagesQueryParameters", "GetMessage", "GetAttachments"].includes(tool),
+    mailSearchMessages: async (args) => {
+      calls.push(["search", args]);
+      return {
+        value: [{
+          id: "g1",
+          subject: "Flat",
+          receivedDateTime: "2026-01-15T10:00:00Z",
+          from: { emailAddress: { name: "Sample User", address: "sample@contoso.com" } },
+          bodyPreview: "Hi",
+        }],
+        hasMoreResults: false,
+      };
+    },
+    mailGetMessage: async (args) => {
+      calls.push(["get", args]);
+      return {
+        message: "Message retrieved successfully.",
+        data: {
+          id: args.id,
+          subject: "Flat",
+          from: "sample@contoso.com",
+          toRecipients: ["jordan.lee@fabrikam.com"],
+          ccRecipients: ["cc@contoso.com"],
+          body: "<p>Flat body</p>",
+          receivedDateTime: "2026-01-15T10:00:00Z",
+          hasAttachments: true,
+        },
+      };
+    },
+    mailGetAttachments: async () => ({ data: [{ id: "a1", name: "plan.pdf", contentType: "application/pdf", size: 10 }] }),
+    fetch: async ([path]) => {
+      if (path.includes("/mailFolders/inbox/") || path.startsWith("/me/messages/")) throw new Error("workiq mail unavailable");
+      return path.startsWith("/me?") ? { results: [{ statusCode: 404, error: "unavailable" }] } : emptyInbox;
+    },
+    update: async () => ({}),
+    action: async () => ({}),
+  };
+  const triage = createTriage({ workiq, statePath: join(stateRoot, "state.json") });
+  const result = await triage.refresh();
+  const [email] = result.items.filter((entry) => entry.source === "email");
+  assert.equal(email.rawId, "g1");
+  const detail = await triage.getDetail(email.id);
+  assert.equal(detail.from.address, "sample@contoso.com");
+  assert.equal(detail.from.name, email.sender);
+  assert.equal(detail.to[0].address, "jordan.lee@fabrikam.com");
+  assert.equal(detail.cc[0].address, "cc@contoso.com");
+  assert.match(detail.bodyText, /Flat body/);
+  assert.equal(detail.attachments[0].name, "plan.pdf");
+  assert.deepEqual(calls.find((call) => call[0] === "get")[1], { id: "g1", preferHtml: true });
+});
+
+test("stripText expands Adaptive Card DATE and TIME macros", () => {
+  assert.equal(stripText("Due {{DATE(2026-11-05T23:30:00Z, SHORT)}}"), "Due Nov 5, 2026");
+  assert.equal(stripText("at {{TIME(2026-11-05T23:30:00Z)}}"), "at 11:30 PM");
+  assert.equal(stripText("{{DATE(not-a-date)}}"), "not-a-date");
+});
+
+test("normalizeTeamsDetailMessage ignores custom reaction placeholders", () => {
+  const normalized = normalizeTeamsDetailMessage({
+    id: "r1",
+    from: { displayName: "Taylor Kim" },
+    body: { contentType: "text", content: "Hello" },
+    reactions: [{ reactionType: "custom" }, { reactionType: "Custom" }, { reactionType: "like" }, { reactionType: "like" }],
+  });
+  assert.deepEqual(normalized.reactions, [{ type: "like", count: 2 }]);
 });
