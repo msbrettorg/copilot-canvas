@@ -201,7 +201,7 @@ export function stripText(value, max = 360) {
         ? String(iso).trim()
         : d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" });
     })
-    .replace(/\{\{TIME\(([^)]+)\)\}\}/gi, (_m, iso) => {
+    .replace(/\{\{TIME\(([^,)]+)(?:,[^)]*)?\)\}\}/gi, (_m, iso) => {
       const d = new Date(String(iso).trim());
       return Number.isNaN(d.getTime())
         ? String(iso).trim()
