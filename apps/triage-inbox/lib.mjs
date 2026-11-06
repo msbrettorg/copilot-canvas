@@ -25,6 +25,7 @@ export const MESSAGE_PAGE_SIZE = 50;
 export const FETCH_BATCH_SIZE = 20;
 export const CHAT_FIELDS = "id,chatType,topic,tenantId,lastUpdatedDateTime,viewpoint,webUrl";
 const PERSISTED_MESSAGE_LIMIT = 20;
+const TEAMS_MCP_CONCURRENCY = 5;
 export const MAIL_PAGE_SIZE = 100;
 export const MAIL_MAX_WINDOW_SPLITS = 30;
 export const MAIL_FIELDS =
@@ -187,9 +188,13 @@ export function replaceEmojiTags(value) {
 }
 
 export function stripText(value, max = 360) {
-  const clean = replaceEmojiTags(value)
-    .replace(/[\u00ad\u034f\u200b-\u200d\u2060\ufeff]+/g, "")
-    .replace(/<[^>]*>/g, " ")
+  const clean = decodeHtml(
+    replaceEmojiTags(value)
+      .replace(/[\u00ad\u034f\u200b-\u200d\u2060\ufeff]+/g, "")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<[^>]*>/g, " "),
+  )
     .replace(/&nbsp;|\u00a0/g, " ")
     .replace(/\[([^\]\n]{1,200})\]\((?:https?:\/\/|mailto:)[^)\s]*\)/gi, "$1")
     .replace(/\*\*([^*\n]+)\*\*/g, "$1")
@@ -1333,7 +1338,11 @@ function resolveJoinUrl(event, blocks, rawHtml = "") {
   return null;
 }
 
-export function normalizeTeamsDetailMessage(message, currentUserId = null) {
+export function normalizeTeamsDetailMessage(
+  message,
+  currentUserId = null,
+  { fallbackSender = "", messageById = null } = {},
+) {
   const contentType = String(message?.body?.contentType ?? "html").toLowerCase();
   const rawContent = String(message?.body?.content ?? "");
   const rawAttachments = Array.isArray(message?.attachments) ? message.attachments : [];
@@ -1343,6 +1352,7 @@ export function normalizeTeamsDetailMessage(message, currentUserId = null) {
     if (attId) attachmentMap.set(attId, att);
   }
   const consumed = new Set();
+  const siblingReplies = [];
   const isPlaceholderOnly = /^\[attachment\]$/i.test(stripText(rawContent, 400));
   const referencedIds = new Set(
     rawAttachments.filter((att) => replyReference(att)).map((att) => String(att?.id ?? "").trim()).filter(Boolean),
@@ -1355,7 +1365,20 @@ export function normalizeTeamsDetailMessage(message, currentUserId = null) {
           (_, id) => {
             const key = String(id ?? "").trim();
             const att = attachmentMap.get(key);
-            if (!att || consumed.has(key)) return "";
+            if (!att) {
+              // A reply can point at a sibling message in the same fetched page instead of carrying an attachment.
+              const quoted = messageById?.get(key);
+              if (quoted && !siblingReplies.some((entry) => entry.id === key)) {
+                const quotedBody = typeof quoted.body === "string" ? quoted.body : quoted.body?.content;
+                siblingReplies.push({
+                  id: key,
+                  sender: previewSender(quoted.from) || clean(fallbackSender) || "Teams message",
+                  preview: stripText(quotedBody, 240),
+                });
+              }
+              return "";
+            }
+            if (consumed.has(key)) return "";
             consumed.add(key);
             const text = attachmentText({ ...att, name: "" }, 8000);
             if (!text) return "";
@@ -1386,14 +1409,11 @@ export function normalizeTeamsDetailMessage(message, currentUserId = null) {
     .filter((block) => block.type !== "hr" && block.text)
     .map((block) => block.text)
     .join("\n\n");
-  const body = fullBody.length > 16000 ? `${fullBody.slice(0, 15999)}…` : fullBody;
-  const from = previewSender(message?.from);
-  const senderId = String(
-    message?.from?.user?.id ?? message?.from?.application?.id ?? message?.from?.device?.id ?? "",
-  )
-    .trim()
-    .toLowerCase();
-  const replyTo = [];
+  let body = fullBody.length > 16000 ? `${fullBody.slice(0, 15999)}…` : fullBody;
+  const rawFrom = previewSender(message?.from);
+  const from = rawFrom || clean(fallbackSender);
+  const senderId = senderIdFrom(message?.from);
+  const replyTo = [...siblingReplies];
   const attachments = [];
   const seenAttachments = new Set();
   for (const att of rawAttachments) {
@@ -1431,6 +1451,10 @@ export function normalizeTeamsDetailMessage(message, currentUserId = null) {
     if (type) reactionCounts.set(type, (reactionCounts.get(type) ?? 0) + 1);
   }
   const reactions = [...reactionCounts].map(([type, count]) => ({ type, count }));
+  if (!blocks.length && !replyTo.length && attachments.some((att) => att.contentType === "image")) {
+    blocks.push({ type: "p", text: "Shared an image", runs: [{ text: "Shared an image" }] });
+    body = "Shared an image";
+  }
   return {
     id: message?.id ?? "",
     from,
@@ -1442,8 +1466,15 @@ export function normalizeTeamsDetailMessage(message, currentUserId = null) {
     replyTo,
     attachments,
     reactions,
-    isMe: matchers.self.test(from) || (currentUserId ? senderId === String(currentUserId).trim().toLowerCase() : false),
+    isMe: isOwnSender(rawFrom, senderId, currentUserId),
   };
+}
+
+function isOwnSender(name, senderId, currentUserId) {
+  return (
+    (name !== "" && matchers.self.test(name)) ||
+    (currentUserId ? senderId === String(currentUserId).trim().toLowerCase() : false)
+  );
 }
 
 function safeHttpsUrl(value) {
@@ -1464,23 +1495,26 @@ function fileNameFromUrl(url) {
 
 export function resolveChatPreview(messages) {
   for (const message of Array.isArray(messages) ? messages : []) {
-    if (/^systemEventMessage$/i.test(message.messageType ?? "")) continue;
+    if (isDeletedOrSystemMessage(message)) continue;
     const body = stripText(message.body?.content, 400);
-    const text = body && !/^\[attachment\]$/i.test(body)
+    let text = body && !/^\[attachment\]$/i.test(body)
       ? body
       : (message.attachments ?? []).map((att) => attachmentText(att, 400)).find(Boolean) ?? "";
+    if (!text && hasNonEmojiImage(message.body?.content)) text = "Shared an image";
     if (!text) continue;
     return {
       body: text,
-      from:
-        message.from?.user?.displayName ??
-        message.from?.application?.displayName ??
-        message.from?.device?.displayName ??
-        "",
+      from: previewSender(message.from),
       createdDateTime: message.createdDateTime ?? null,
     };
   }
   return null;
+}
+
+function hasNonEmojiImage(content) {
+  return [...String(content ?? "").matchAll(/<img\b[^>]*>/gi)].some(
+    (tag) => !/itemtype\s*=\s*["'][^"']*Emoji/i.test(tag[0]),
+  );
 }
 
 export function toWorkIqRelativeUrl(nextLink) {
@@ -1616,7 +1650,12 @@ export function normalizeItem(input) {
       ? {
           chatId: input.chatId ?? rawId,
           tenantId: input.tenantId ?? null,
-          ...(Array.isArray(input.messages) && input.messages.length ? { messages: input.messages } : {}),
+          ...(Array.isArray(input.messages) && input.messages.length
+            ? (() => {
+                const kept = input.messages.filter((m) => String(m?.body ?? "").trim() !== "Unread message in Teams");
+                return kept.length ? { messages: kept } : {};
+              })()
+            : {}),
           ...(Array.isArray(input.members) && input.members.length ? { members: input.members } : {}),
         }
       : { messageId: input.messageId ?? rawId }),
@@ -1688,14 +1727,25 @@ export function workIqFetchData(payload, index, label) {
   return result.data;
 }
 
+// Handles both the flat `teams` MCP shape and the nested Graph shape.
 function previewSender(from) {
-  if (typeof from === "string") return from;
-  return (
-    from?.user?.displayName ??
-    from?.application?.displayName ??
-    from?.device?.displayName ??
-    ""
-  );
+  if (typeof from === "string") return from.trim();
+  return String(
+    from?.displayName ??
+      from?.user?.displayName ??
+      from?.application?.displayName ??
+      from?.device?.displayName ??
+      "",
+  ).trim();
+}
+
+function senderIdFrom(from) {
+  if (!from || typeof from !== "object") return "";
+  return String(
+    from.id ?? from.userId ?? from.user?.id ?? from.application?.id ?? from.device?.id ?? "",
+  )
+    .trim()
+    .toLowerCase();
 }
 
 // A verified /me profile (not the built-in sample identity) lets us recognize the signed-in user's own messages.
@@ -1705,15 +1755,22 @@ function isVerifiedIdentity() {
 
 export function normalizeWorkIqChat(chat, { currentUserId = null } = {}) {
   const preview = chat?.lastMessagePreview ?? {};
-  // lastUpdatedDateTime only moves on rename/roster changes, so the last message's own time wins.
-  const activityAt = preview.createdDateTime || preview.lastModifiedDateTime || chat?.lastUpdatedDateTime || null;
-  const previewAt = Date.parse(activityAt);
-  const readAt = Date.parse(chat?.viewpoint?.lastMessageReadDateTime);
-  let hasUnreadMessages = Number.isFinite(previewAt) && (!Number.isFinite(readAt) || previewAt > readAt);
   const rawBody = preview.body;
   const body = typeof rawBody === "string" ? rawBody : rawBody?.content ?? "";
   const from = previewSender(preview.from);
-  const fromId = String(preview.from?.user?.id ?? "").trim().toLowerCase();
+  const fromId = senderIdFrom(preview.from);
+  const previewCreatedAt = preview.createdDateTime ?? preview.lastModifiedDateTime ?? null;
+  let hasUnreadMessages;
+  if (typeof chat?.hasUnreadMessages === "boolean") {
+    hasUnreadMessages = chat.hasUnreadMessages;
+    // A meeting chat holding only system events has no message to read.
+    if (!previewCreatedAt && !body.trim() && !from) hasUnreadMessages = false;
+  } else {
+    // lastUpdatedDateTime only moves on rename/roster changes, so the last message's own time wins.
+    const previewAt = Date.parse(previewCreatedAt);
+    const readAt = Date.parse(chat?.viewpoint?.lastMessageReadDateTime);
+    hasUnreadMessages = Number.isFinite(previewAt) && (!Number.isFinite(readAt) || previewAt > readAt);
+  }
   // The last message is mine, so I have read the thread.
   if (
     hasUnreadMessages &&
@@ -1728,7 +1785,7 @@ export function normalizeWorkIqChat(chat, { currentUserId = null } = {}) {
     lastMessagePreview: {
       body,
       from,
-      createdDateTime: preview.createdDateTime ?? preview.lastModifiedDateTime ?? null,
+      createdDateTime: previewCreatedAt,
       mentions: Array.isArray(preview.mentions) ? preview.mentions : [],
     },
   };
@@ -1737,12 +1794,14 @@ export function normalizeWorkIqChat(chat, { currentUserId = null } = {}) {
 // Graph sets "@removed" and "eventDetail" to an explicit null on ordinary messages, so only a non-null value counts.
 export function isDeletedOrSystemMessage(source) {
   const messageType = clean(source?.messageType);
+  const rawContent = clean(typeof source?.body === "string" ? source.body : source?.body?.content);
   return (
     source?.["@removed"] != null ||
     source?.isDeleted === true ||
     Boolean(clean(source?.deletedDateTime)) ||
     Boolean(messageType && !/^message$/i.test(messageType)) ||
-    source?.eventDetail != null
+    source?.eventDetail != null ||
+    /^<systemEventMessage\s*\/?>$/i.test(rawContent)
   );
 }
 
@@ -1752,8 +1811,40 @@ export function messagePath(chatId) {
   return `/chats/${encodeURIComponent(chatId)}/messages?$top=${MESSAGE_PAGE_SIZE}&$orderby=createdDateTime%20desc`;
 }
 
+const SERVER_TOOL_METHODS = {
+  "teams.ListChats": "teamsListChats",
+  "teams.ListChatMessages": "teamsListChatMessages",
+  "teams.ListChatMembers": "teamsListChatMembers",
+  "teams.UpdateChat": "teamsUpdateChat",
+  "teams.SendMessageToChat": "teamsSendMessageToChat",
+  "mail.SearchMessagesQueryParameters": "mailSearchMessages",
+  "mail.GetMessage": "mailGetMessage",
+  "mail.GetAttachments": "mailGetAttachments",
+  "mail.ReplyToMessage": "mailReplyToMessage",
+  "mail.ReplyAllToMessage": "mailReplyAllToMessage",
+  "mail.ForwardMessage": "mailForwardMessage",
+  "mail.DeleteMessage": "mailDeleteMessage",
+};
+
+// A host adapter reports which MCP servers it exposes; a plain mock is used when it supplies the wrapper itself.
+async function canUseServerTool(workiq, server, tool) {
+  if (typeof workiq?.hasServerTool === "function") return Boolean(await workiq.hasServerTool(server, tool));
+  return typeof workiq?.[SERVER_TOOL_METHODS[`${server}.${tool}`]] === "function";
+}
+
 // Single /me/chats page: WorkIQ rejects Graph's $skiptoken continuation, so the ~50 newest chats are all we can see.
 export async function fetchCandidateChats(workiq, { currentUserId = null } = {}) {
+  if (await canUseServerTool(workiq, "teams", "ListChats")) {
+    const data = await workiq.teamsListChats({ fetchAllPages: false });
+    const values = Array.isArray(data?.chats) ? data.chats : Array.isArray(data?.value) ? data.value : [];
+    const chats = values.map((value) => normalizeWorkIqChat(value, { currentUserId }));
+    return {
+      chats,
+      unread: chats.filter((chat) => chat.hasUnreadMessages),
+      fetched: Number(data?.totalScanned ?? values.length),
+      truncated: Boolean(data?.hasMoreResults),
+    };
+  }
   const path = `/me/chats?$select=${CHAT_FIELDS}&$expand=lastMessagePreview&$top=${CHAT_PAGE_SIZE}`;
   const data = workIqFetchData(await workiq.fetch([path]), 0, "chat page 1");
   const values = Array.isArray(data?.value) ? data.value : [];
@@ -1769,6 +1860,33 @@ export async function fetchCandidateChats(workiq, { currentUserId = null } = {})
 // Reads recent messages for each chat in batches of FETCH_BATCH_SIZE. A failed entity or batch never discards the rest.
 export async function fetchRecentMessages(workiq, chats, { signal } = {}) {
   const outcomes = new Map();
+  if (await canUseServerTool(workiq, "teams", "ListChatMessages")) {
+    for (let offset = 0; offset < chats.length; offset += TEAMS_MCP_CONCURRENCY) {
+      if (signal?.aborted) break;
+      const chunk = chats.slice(offset, offset + TEAMS_MCP_CONCURRENCY);
+      await Promise.all(
+        chunk.map(async (chat) => {
+          try {
+            const res = await workiq.teamsListChatMessages({
+              chatId: chat.id,
+              top: PERSISTED_MESSAGE_LIMIT,
+              include: "attachments,reactions",
+            });
+            const values = Array.isArray(res?.messages) ? res.messages : Array.isArray(res?.value) ? res.value : [];
+            outcomes.set(chat.id, { ok: true, statusCode: 200, error: null, values });
+          } catch (error) {
+            outcomes.set(chat.id, {
+              ok: false,
+              statusCode: error?.httpStatus || 500,
+              error: error.message,
+              values: [],
+            });
+          }
+        }),
+      );
+    }
+    return outcomes;
+  }
   const fetchBatch = workiq.fetchPartial ?? workiq.fetch;
   for (let offset = 0; offset < chats.length; offset += FETCH_BATCH_SIZE) {
     if (signal?.aborted) break;
@@ -2162,10 +2280,11 @@ export async function fetchCalendarEventDetail(workiq, eventId) {
 // Fallback thread built from the chat preview so a Teams item always opens with its latest message.
 function previewThreadMessage(item) {
   const body = String(item.summary ?? "").trim();
-  if (!body) return null;
+  if (!body || body === UNREAD_PLACEHOLDER) return null;
   const from = item.sender || "Teams message";
   return {
     id: `preview-${item.id}`,
+    syntheticPreview: true,
     from,
     sender: from,
     senderId: "",
@@ -2177,6 +2296,49 @@ function previewThreadMessage(item) {
     reactions: [],
     isMe: matchers.self.test(from),
   };
+}
+
+const UNREAD_PLACEHOLDER = "Unread message in Teams";
+
+function isSyntheticPreviewMessage(message) {
+  return (
+    Boolean(message?.syntheticPreview) ||
+    String(message?.id ?? "").startsWith("preview-") ||
+    String(message?.body ?? "").trim() === UNREAD_PLACEHOLDER
+  );
+}
+
+function hasRealStoredThread(item) {
+  return (
+    Array.isArray(item?.messages) &&
+    item.messages.length > 0 &&
+    item.messages.some((message) => !isSyntheticPreviewMessage(message))
+  );
+}
+
+// Removes placeholder bubbles and chats that only ever held system events from persisted state.
+function cleanLegacyTeamsItems(state) {
+  let changed = 0;
+  const kept = [];
+  for (const item of state.items) {
+    if (item?.source === "teams") {
+      if (Array.isArray(item.messages)) {
+        const messages = item.messages.filter((m) => String(m?.body ?? "").trim() !== UNREAD_PLACEHOLDER);
+        if (messages.length !== item.messages.length) {
+          changed += 1;
+          if (messages.length) item.messages = messages;
+          else delete item.messages;
+        }
+      }
+      if (String(item.summary ?? "").trim() === UNREAD_PLACEHOLDER && !hasRealStoredThread(item)) {
+        changed += 1;
+        continue;
+      }
+    }
+    kept.push(item);
+  }
+  if (kept.length !== state.items.length) state.items = kept;
+  return changed;
 }
 
 // Cached @MENTION roles from older classifiers matched plain salutations such as "Hi <first name>,".
@@ -2720,7 +2882,7 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
           state.userProfile = parsed.userProfile;
           setActiveIdentity(parsed.userProfile);
         }
-        if (repairCachedRoles(state.items)) await save({ touch: false }).catch(() => {});
+        if (repairCachedRoles(state.items) + cleanLegacyTeamsItems(state)) await save({ touch: false }).catch(() => {});
       } catch (error) {
         if (error.code !== "ENOENT") {
           throw new TriageError("state_read_failed", `Cannot read local state: ${error.message}`);
@@ -2949,16 +3111,24 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
   }
 
   // Turns raw Graph messages into the persisted thread (newest PERSISTED_MESSAGE_LIMIT, oldest first) and its participants.
-  function buildChatThread(values) {
+  function buildChatThread(values, { fallbackSender = "" } = {}) {
+    const messageById = new Map(
+      values.filter((m) => m?.id).map((m) => [String(m.id).trim(), m]),
+    );
     const visible = values
       .filter((message) => !isDeletedOrSystemMessage(message))
       .sort((a, b) => messageTime(b).localeCompare(messageTime(a)));
     const messages = visible
       .slice(0, PERSISTED_MESSAGE_LIMIT)
-      .map((message) => normalizeTeamsDetailMessage(message, currentUserId))
+      .map((message) => normalizeTeamsDetailMessage(message, currentUserId, { fallbackSender, messageById }))
       .filter((message) => message.body || message.replyTo.length || message.attachments.length)
       .sort((a, b) => messageTime(a).localeCompare(messageTime(b)));
-    const members = dedupePeople(visible.map((message) => message?.from?.user).filter(Boolean).map(normalizeMember));
+    const members = dedupePeople(
+      visible
+        .map((message) => message?.from?.user ?? (message?.from?.displayName ? message.from : null))
+        .filter(Boolean)
+        .map(normalizeMember),
+    );
     return { messages, members, latest: resolveChatPreview(visible) };
   }
 
@@ -2972,27 +3142,55 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
 
   // A chat opens from its persisted thread; WorkIQ is only read when no thread is stored or a refresh is forced.
   async function teamsDetail(item, { forceRefresh = false } = {}) {
-    if (!forceRefresh && Array.isArray(item.messages) && item.messages.length > 0) return storedThread(item);
+    if (!forceRefresh && hasRealStoredThread(item)) return storedThread(item);
     let outcome = null;
     let failure = null;
+    let mcpMembers = [];
     try {
-      const fetchBatch = workiq.fetchPartial ?? workiq.fetch;
-      const payload = await fetchBatch.call(workiq, [messagePath(item.rawId)], { tolerateEntityErrors: true });
-      [outcome] = extractWorkIqEntityOutcomes(payload);
+      if (await canUseServerTool(workiq, "teams", "ListChatMessages")) {
+        const res = await workiq.teamsListChatMessages({
+          chatId: item.rawId,
+          top: PERSISTED_MESSAGE_LIMIT,
+          include: "attachments,reactions",
+        });
+        const value = Array.isArray(res?.messages) ? res.messages : Array.isArray(res?.value) ? res.value : [];
+        outcome = { statusCode: 200, data: { value } };
+        if (!(item.members ?? []).length && (await canUseServerTool(workiq, "teams", "ListChatMembers"))) {
+          try {
+            const membersRes = await workiq.teamsListChatMembers({ chatId: item.rawId });
+            mcpMembers = Array.isArray(membersRes?.members)
+              ? membersRes.members
+              : Array.isArray(membersRes?.value)
+                ? membersRes.value
+                : [];
+          } catch {
+            // Members are optional; the thread still renders without them.
+          }
+        }
+      } else {
+        const fetchBatch = workiq.fetchPartial ?? workiq.fetch;
+        const payload = await fetchBatch.call(workiq, [messagePath(item.rawId)], { tolerateEntityErrors: true });
+        [outcome] = extractWorkIqEntityOutcomes(payload);
+      }
     } catch (error) {
       failure = error;
     }
     if (outcome && outcome.statusCode >= 200 && outcome.statusCode < 300 && outcome.data) {
-      const thread = buildChatThread(Array.isArray(outcome.data.value) ? outcome.data.value : []);
+      const thread = buildChatThread(Array.isArray(outcome.data.value) ? outcome.data.value : [], {
+        fallbackSender: item.sender || item.title || "",
+      });
       if (thread.messages.length) {
         if (thread.latest) syncChatRow(item, thread.latest);
         item.messages = thread.messages;
-        item.members = thread.members;
+        item.members = thread.members.length ? thread.members : dedupePeople(mcpMembers.map(normalizeMember));
         await commit();
         return storedThread(item);
       }
+      if (!hasRealStoredThread(item)) {
+        throw new TriageError("m365_error", "This Teams chat contains only system events and no messages");
+      }
     }
-    if (Array.isArray(item.messages) && item.messages.length > 0) return storedThread(item);
+    if (hasRealStoredThread(item)) return storedThread(item);
     const fallback = previewThreadMessage(item);
     if (!fallback) {
       throw failure ?? new TriageError("m365_error", `chat messages ${item.rawId}: WorkIQ returned no messages`);
@@ -3004,25 +3202,46 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
     const select =
       "id,subject,body,uniqueBody,bodyPreview,from,sender,toRecipients,ccRecipients,replyTo," +
       "receivedDateTime,sentDateTime,conversationId,importance,hasAttachments,webLink,flag";
-    const payload = await workiq.fetch([`/me/messages/${encodeURIComponent(item.rawId)}?$select=${select}`]);
-    const message = workIqFetchData(payload, 0, `email ${item.rawId}`);
+    const mapAttachments = (list) =>
+      list.map((attachment) => ({
+        id: attachment.id,
+        name: attachment.name ?? "Attachment",
+        contentType: attachment.contentType ?? "",
+        size: attachment.size ?? 0,
+        isInline: Boolean(attachment.isInline),
+      }));
+    let message;
     let attachments = [];
-    if (message.hasAttachments) {
-      const [attachmentOutcome] = await Promise.allSettled([
-        workiq.fetch([`/me/messages/${encodeURIComponent(item.rawId)}/attachments?$select=id,name,contentType,size,isInline`]),
-      ]);
-      if (attachmentOutcome.status === "fulfilled") {
+    if (await canUseServerTool(workiq, "mail", "GetMessage")) {
+      message = await workiq.mailGetMessage({ id: item.rawId, preferHtml: true });
+      if (!message || typeof message !== "object" || Array.isArray(message)) {
+        throw new TriageError("workiq_invalid_result", `email ${item.rawId}: mail server returned no message`);
+      }
+      if (message.hasAttachments && (await canUseServerTool(workiq, "mail", "GetAttachments"))) {
         try {
-          attachments = (workIqFetchData(attachmentOutcome.value, 0, `email attachments ${item.rawId}`)?.value ?? [])
-            .map((attachment) => ({
-              id: attachment.id,
-              name: attachment.name ?? "Attachment",
-              contentType: attachment.contentType ?? "",
-              size: attachment.size ?? 0,
-              isInline: Boolean(attachment.isInline),
-            }));
+          const res = await workiq.mailGetAttachments({ id: item.rawId });
+          attachments = mapAttachments(
+            Array.isArray(res?.value) ? res.value : Array.isArray(res?.attachments) ? res.attachments : [],
+          );
         } catch {
           attachments = [];
+        }
+      }
+    } else {
+      const payload = await workiq.fetch([`/me/messages/${encodeURIComponent(item.rawId)}?$select=${select}`]);
+      message = workIqFetchData(payload, 0, `email ${item.rawId}`);
+      if (message.hasAttachments) {
+        const [attachmentOutcome] = await Promise.allSettled([
+          workiq.fetch([`/me/messages/${encodeURIComponent(item.rawId)}/attachments?$select=id,name,contentType,size,isInline`]),
+        ]);
+        if (attachmentOutcome.status === "fulfilled") {
+          try {
+            attachments = mapAttachments(
+              workIqFetchData(attachmentOutcome.value, 0, `email attachments ${item.rawId}`)?.value ?? [],
+            );
+          } catch {
+            attachments = [];
+          }
         }
       }
     }
@@ -3351,6 +3570,31 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
   // fresh `receivedDateTime le <oldest seen>` query instead of a continuation link.
   async function fetchUnreadInbox() {
     const select = "id,subject,from,toRecipients,ccRecipients,receivedDateTime,bodyPreview,webLink,importance,inferenceClassification";
+    if (await canUseServerTool(workiq, "mail", "SearchMessagesQueryParameters")) {
+      // $filter combined with $orderby fails with InefficientFilter, so sort client-side.
+      const collected = [];
+      const seenIds = new Set();
+      let args = { queryParameters: `?$filter=isRead eq false&$select=${select}&$top=${PAGE_SIZE}` };
+      for (let page = 0; args && page < MAX_EMAIL_PAGES; page++) {
+        let data;
+        try {
+          data = await workiq.mailSearchMessages(args);
+        } catch (error) {
+          if (page === 0) throw error;
+          break;
+        }
+        for (const record of Array.isArray(data?.value) ? data.value : []) {
+          if (record?.id !== undefined) {
+            if (seenIds.has(record.id)) continue;
+            seenIds.add(record.id);
+          }
+          collected.push(record);
+        }
+        const nextLink = data?.nextLink ?? data?.["@odata.nextLink"];
+        args = nextLink && (data?.hasMoreResults ?? true) ? { nextLink } : null;
+      }
+      return collected.sort((a, b) => String(b.receivedDateTime ?? "").localeCompare(String(a.receivedDateTime ?? "")));
+    }
     const query = (filter) =>
       `/me/mailFolders/inbox/messages?$filter=${encodeURIComponent(filter)}&$select=${select}` +
       `&$orderby=receivedDateTime%20desc&$top=${PAGE_SIZE}`;
@@ -3424,22 +3668,28 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
     const toFetch = unread.filter((chat) => {
       if (needsPreviewResolution(chat)) return true;
       const prior = priorByRawId.get(chat.id);
-      if (!Array.isArray(prior?.messages) || prior.messages.length === 0) return true;
+      if (!hasRealStoredThread(prior)) return true;
       return !prior.receivedAt || prior.receivedAt !== chat.lastMessagePreview?.createdDateTime;
     });
     const outcomes = await fetchRecentMessages(workiq, toFetch);
     const threads = new Map();
+    const emptyHumanChats = new Set();
     for (const chat of unread) {
       const outcome = outcomes.get(chat.id);
       if (!outcome?.ok) continue;
-      const thread = buildChatThread(outcome.values);
-      if (!thread.messages.length) continue;
+      const fallbackSender = chat.lastMessagePreview?.from || chat.topic || "";
+      const thread = buildChatThread(outcome.values, { fallbackSender });
+      if (!thread.messages.length) {
+        // Only system events: there is nothing to read, so never keep or synthesize an item.
+        emptyHumanChats.add(chat.id);
+        continue;
+      }
       threads.set(chat.id, thread);
-      if (needsPreviewResolution(chat) && thread.latest) {
+      if ((needsPreviewResolution(chat) || !chat.lastMessagePreview?.from) && thread.latest) {
         chat.lastMessagePreview = {
           ...(chat.lastMessagePreview ?? {}),
           body: thread.latest.body,
-          from: thread.latest.from,
+          from: thread.latest.from || chat.lastMessagePreview?.from || fallbackSender,
           createdDateTime: thread.latest.createdDateTime ?? chat.lastMessagePreview?.createdDateTime ?? null,
         };
         chat.hasUnreadMessages = true;
@@ -3448,6 +3698,7 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
 
     const items = [];
     for (const chat of unread) {
+      if (emptyHumanChats.has(chat.id)) continue;
       const item = classifyChat(chat);
       if (!item) continue;
       const thread = threads.get(chat.id);
@@ -3455,10 +3706,15 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
       if (thread) {
         item.messages = thread.messages;
         item.members = thread.members;
+        if (!item.sender && thread.latest?.from) item.sender = thread.latest.from;
+        if ((!item.summary || item.summary === UNREAD_PLACEHOLDER) && thread.latest?.body) {
+          item.summary = stripText(thread.latest.body);
+        }
       } else {
         // The batch failed or skipped this chat: keep the stored thread and add the newer preview when there is one.
-        const stored = Array.isArray(prior?.messages) ? prior.messages : [];
+        const stored = Array.isArray(prior?.messages) ? prior.messages.filter((m) => !isSyntheticPreviewMessage(m)) : [];
         const preview = previewThreadMessage(item);
+        if (!stored.length && !preview) continue;
         const lastStored = stored.at(-1);
         const previewIsNewer =
           preview && (!lastStored || messageTime(preview) > messageTime(lastStored)) && preview.body !== lastStored?.body;
@@ -3540,17 +3796,21 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
       broadcast("pending", { id });
       try {
         if (item.source === "teams") {
-          const [userId, tenantId] = await Promise.all([
-            getCurrentUserId(),
-            item.tenantId ? item.tenantId : getChatTenantId(item.rawId),
-          ]);
-          await workiq.action(`/chats/${item.rawId}/markChatReadForUser`, {
-            user: {
-              id: userId,
-              tenantId,
-              "@odata.type": "#microsoft.graph.teamworkUserIdentity",
-            },
-          });
+          if (await canUseServerTool(workiq, "teams", "UpdateChat")) {
+            await workiq.teamsUpdateChat({ chatId: item.rawId, action: "markRead" });
+          } else {
+            const [userId, tenantId] = await Promise.all([
+              getCurrentUserId(),
+              item.tenantId ? item.tenantId : getChatTenantId(item.rawId),
+            ]);
+            await workiq.action(`/chats/${item.rawId}/markChatReadForUser`, {
+              user: {
+                id: userId,
+                tenantId,
+                "@odata.type": "#microsoft.graph.teamworkUserIdentity",
+              },
+            });
+          }
         } else {
           await markMessageRead(item.rawId);
         }
@@ -3584,17 +3844,28 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
       let hideFailure = null;
       try {
         if (item.source === "teams") {
-          const [userId, tenantId] = await Promise.all([
-            getCurrentUserId(),
-            item.tenantId ? item.tenantId : getChatTenantId(item.rawId),
-          ]);
-          const user = { id: userId, tenantId, "@odata.type": "#microsoft.graph.teamworkUserIdentity" };
-          await workiq.action(`/chats/${item.rawId}/markChatReadForUser`, { user });
-          try {
-            await workiq.action(`/chats/${item.rawId}/hideForUser`, { user });
-          } catch (hideError) {
-            hideFailure = hideError.message;
+          if (await canUseServerTool(workiq, "teams", "UpdateChat")) {
+            await workiq.teamsUpdateChat({ chatId: item.rawId, action: "markRead" });
+            try {
+              await workiq.teamsUpdateChat({ chatId: item.rawId, action: "hide" });
+            } catch (hideError) {
+              hideFailure = hideError.message;
+            }
+          } else {
+            const [userId, tenantId] = await Promise.all([
+              getCurrentUserId(),
+              item.tenantId ? item.tenantId : getChatTenantId(item.rawId),
+            ]);
+            const user = { id: userId, tenantId, "@odata.type": "#microsoft.graph.teamworkUserIdentity" };
+            await workiq.action(`/chats/${item.rawId}/markChatReadForUser`, { user });
+            try {
+              await workiq.action(`/chats/${item.rawId}/hideForUser`, { user });
+            } catch (hideError) {
+              hideFailure = hideError.message;
+            }
           }
+        } else if (await canUseServerTool(workiq, "mail", "DeleteMessage")) {
+          await workiq.mailDeleteMessage({ id: item.rawId });
         } else if (typeof workiq.delete === "function") {
           await workiq.delete(`/me/messages/${item.rawId}`);
         } else {
@@ -3756,14 +4027,21 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
       let result;
       try {
         if (item.source === "teams") {
-          const created = entityResult(
-            await workiq.create(`/me/chats/${item.rawId}/messages`, {
-              body: { contentType: "text", content: body },
-            }),
-          );
+          const useMcp = await canUseServerTool(workiq, "teams", "SendMessageToChat");
+          const created = useMcp
+            ? await workiq.teamsSendMessageToChat({ chatId: item.rawId, content: body })
+            : entityResult(
+                await workiq.create(`/me/chats/${item.rawId}/messages`, {
+                  body: { contentType: "text", content: body },
+                }),
+              );
           try {
-            const user = await getTeamsUserIdentity(item.rawId, item.tenantId);
-            await workiq.action(`/chats/${item.rawId}/markChatReadForUser`, { user });
+            if (await canUseServerTool(workiq, "teams", "UpdateChat")) {
+              await workiq.teamsUpdateChat({ chatId: item.rawId, action: "markRead" });
+            } else {
+              const user = await getTeamsUserIdentity(item.rawId, item.tenantId);
+              await workiq.action(`/chats/${item.rawId}/markChatReadForUser`, { user });
+            }
           } catch (error) {
             readFailure = error.message;
           }
@@ -3790,14 +4068,27 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
             throw new TriageError("invalid_reply", 'Email reply mode must be "reply", "replyAll", or "forward"');
           }
           const jsonBody = { Comment: body };
+          let recipients = [];
           if (mode === "forward") {
-            const recipients = parseRecipients(options.to);
+            recipients = parseRecipients(options.to);
             if (!recipients.length) {
               throw new TriageError("invalid_recipients", "Forward requires at least one valid email address");
             }
             jsonBody.ToRecipients = recipients;
           }
-          await workiq.action(`/me/messages/${item.rawId}/${mode}`, jsonBody);
+          if (mode === "reply" && (await canUseServerTool(workiq, "mail", "ReplyToMessage"))) {
+            await workiq.mailReplyToMessage({ id: item.rawId, comment: body, sendImmediately: true });
+          } else if (mode === "replyAll" && (await canUseServerTool(workiq, "mail", "ReplyAllToMessage"))) {
+            await workiq.mailReplyAllToMessage({ id: item.rawId, comment: body, sendImmediately: true });
+          } else if (mode === "forward" && (await canUseServerTool(workiq, "mail", "ForwardMessage"))) {
+            await workiq.mailForwardMessage({
+              messageId: item.rawId,
+              introComment: body,
+              additionalTo: recipients.map((r) => r.emailAddress.address),
+            });
+          } else {
+            await workiq.action(`/me/messages/${item.rawId}/${mode}`, jsonBody);
+          }
           try {
             await markMessageRead(item.rawId);
           } catch (error) {

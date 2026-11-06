@@ -364,6 +364,52 @@ export function unwrapWorkIqResult(
   return text ? { text } : {};
 }
 
+/**
+ * Decodes a result from a dedicated MCP server such as `teams` or `mail`.
+ * The mail server wraps Graph JSON in `{ rawResponse, hasMoreResults, nextLink }`.
+ */
+export function unwrapMcpServerResult(result, label) {
+  if (!result || typeof result !== "object") {
+    throw new WorkIqError("workiq_empty", `${label}: MCP server returned no result`);
+  }
+  if (result.isError) {
+    const detail = extractIsErrorDetail(result);
+    throw markRateLimit(
+      new WorkIqError("workiq_error", `${label}: ${detail || "MCP server rejected the tool call"}`),
+      result.structuredContent,
+    );
+  }
+
+  let payload;
+  const structured = result.structuredContent;
+  if (structured !== undefined && structured !== null) {
+    payload = typeof structured === "string" ? parseJsonText(structured) : structured;
+  } else {
+    for (const part of result.content ?? []) {
+      if (typeof part?.text !== "string" || !part.text.trim()) continue;
+      try {
+        payload = JSON.parse(part.text);
+        break;
+      } catch {
+        // Try the next text block.
+      }
+    }
+  }
+
+  if (payload && typeof payload === "object" && payload.rawResponse !== undefined) {
+    const inner = typeof payload.rawResponse === "string" ? parseJsonText(payload.rawResponse) : payload.rawResponse;
+    if (inner && typeof inner === "object") {
+      return {
+        ...inner,
+        ...(payload.hasMoreResults !== undefined ? { hasMoreResults: payload.hasMoreResults } : {}),
+        ...(payload.nextLink !== undefined ? { nextLink: payload.nextLink } : {}),
+      };
+    }
+    return inner;
+  }
+  return payload ?? {};
+}
+
 function validatePayload(payload, label) {
   if (!payload || typeof payload !== "object") return payload;
   if (payload.error || payload.statusCode >= 400) {
@@ -657,6 +703,7 @@ export function createWorkIqHostAdapter({
   let useBridge = false;
   let cooldownUntil = 0;
   let bridgePublisher = null;
+  const serverToolCache = new Map();
   const directClient = typeof getAccessToken === "function"
     ? createWorkIqDirectClient({ getAccessToken, endpoint: directEndpoint, fetchImpl })
     : null;
@@ -771,6 +818,61 @@ export function createWorkIqHostAdapter({
       if (await reconnect()) return discoverOnce();
       throw error;
     }
+  }
+
+  async function discoverServerTools(targetServer) {
+    if (targetServer === serverName) return discoverTools();
+    if (directClient) return new Set();
+    if (typeof listTools !== "function" || typeof callTool !== "function") return new Set();
+    if (!serverToolCache.has(targetServer)) {
+      const params = { serverName: targetServer, originServerName: targetServer };
+      const pending = (async () => {
+        let result;
+        try {
+          result = useBridge ? await callBridge("listTools", params) : await listTools(params);
+        } catch (error) {
+          if (!bridgePath || useBridge || !BRIDGE_FALLBACK_ERROR.test(String(error?.message ?? error))) throw error;
+          result = await callBridge("listTools", params);
+        }
+        const tools = Array.isArray(result?.tools) ? result.tools : [];
+        return new Set(tools.map((tool) => tool?.name).filter(Boolean));
+      })().catch(() => {
+        serverToolCache.delete(targetServer);
+        return new Set();
+      });
+      serverToolCache.set(targetServer, pending);
+    }
+    return serverToolCache.get(targetServer);
+  }
+
+  async function hasServerTool(targetServer, toolName) {
+    return (await discoverServerTools(targetServer)).has(toolName);
+  }
+
+  async function callServerTool(targetServer, toolName, args = {}) {
+    if (!(await hasServerTool(targetServer, toolName))) {
+      throw new WorkIqError("mcp_tool_unavailable", `${targetServer}.${toolName} is not available`);
+    }
+    const label = `${targetServer}.${toolName}`;
+    const callArgs = {
+      serverName: targetServer,
+      originServerName: targetServer,
+      toolName,
+      arguments: args,
+    };
+    let result;
+    if (useBridge) {
+      result = await callBridge("callTool", callArgs);
+    } else {
+      try {
+        result = await callTool(callArgs);
+      } catch (error) {
+        if (!bridgePath || !BRIDGE_FALLBACK_ERROR.test(String(error?.message ?? error))) throw markRateLimit(error);
+        result = await callBridge("callTool", callArgs);
+        useBridge = true;
+      }
+    }
+    return unwrapMcpServerResult(result, label);
   }
 
   function shouldReconnect(error, operation) {
@@ -916,13 +1018,22 @@ export function createWorkIqHostAdapter({
     rawListTools: directClient
       ? () => hostListTools()
       : typeof listTools === "function"
-        ? (params) => hostListTools({ serverName, originServerName: serverName, ...params })
+        ? (params) => {
+            const target = params?.serverName || serverName;
+            return hostListTools({ ...params, serverName: target, originServerName: params?.originServerName || target });
+          }
         : null,
     rawCallTool: typeof callTool === "function" || directClient
       ? async (params) => {
+          const target = params?.serverName || serverName;
           const result = directClient
             ? await hostCallTool(params)
-            : await hostCallTool({ serverName, originServerName: serverName, ...params });
+            : await hostCallTool({
+                serverName: target,
+                originServerName: params?.originServerName || target,
+                toolName: params?.toolName,
+                arguments: params?.arguments ?? {},
+              });
           if (!result?.isError) {
             await publishVerifiedDirectCall(result, describeCall(params?.toolName ?? "raw call", params?.arguments ?? {}));
           }
@@ -936,6 +1047,20 @@ export function createWorkIqHostAdapter({
         return false;
       }
     },
+    hasServerTool: (targetServer, toolName) => hasServerTool(targetServer, toolName),
+    callServerTool: (targetServer, toolName, args) => callServerTool(targetServer, toolName, args),
+    teamsListChats: (args = { fetchAllPages: false }) => callServerTool("teams", "ListChats", args),
+    teamsListChatMessages: (args) => callServerTool("teams", "ListChatMessages", args),
+    teamsListChatMembers: (args) => callServerTool("teams", "ListChatMembers", args),
+    teamsUpdateChat: (args) => callServerTool("teams", "UpdateChat", args),
+    teamsSendMessageToChat: (args) => callServerTool("teams", "SendMessageToChat", args),
+    mailSearchMessages: (args) => callServerTool("mail", "SearchMessagesQueryParameters", args),
+    mailGetMessage: (args) => callServerTool("mail", "GetMessage", args),
+    mailGetAttachments: (args) => callServerTool("mail", "GetAttachments", args),
+    mailReplyToMessage: (args) => callServerTool("mail", "ReplyToMessage", args),
+    mailReplyAllToMessage: (args) => callServerTool("mail", "ReplyAllToMessage", args),
+    mailForwardMessage: (args) => callServerTool("mail", "ForwardMessage", args),
+    mailDeleteMessage: (args) => callServerTool("mail", "DeleteMessage", args),
     retrieve: (args) => optionalTool("retrieve", args),
     ask: (args) => optionalTool("ask", args),
     fetch: (entityUrls) => call("fetch", { entityUrls }),

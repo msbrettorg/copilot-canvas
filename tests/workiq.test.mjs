@@ -20,6 +20,7 @@ import {
   formatRecurrence,
   graphDateTimeToUtcIso,
   isDeletedOrSystemMessage,
+  normalizeWorkIqChat,
   isOutlookOwaDeepLink,
   readEmailWindow,
   readEmailWindowSlice,
@@ -51,6 +52,7 @@ import {
   extractWorkIqEntityResults,
   extractWorkIqPayload,
   normalizeWorkIqToolName,
+  unwrapMcpServerResult,
   unwrapWorkIqResult,
   validateWorkIqToolSurface,
 } from "../apps/triage-inbox/workiq.mjs";
@@ -2511,7 +2513,7 @@ test("fetchChats reuses the stored thread when a message batch fails", async (t)
   assert.deepEqual(item.messages.map((message) => message.id), ["m-live"]);
 });
 
-test("fetchChats keeps unread chats when preview lookup fails", async (t) => {
+test("fetchChats never synthesizes an 'Unread message in Teams' item when preview lookup fails", async (t) => {
   const stateRoot = await mkdtemp(join(tmpdir(), "triage-workiq-"));
   t.after(() => rm(stateRoot, { recursive: true, force: true }));
   const blank = (id) =>
@@ -2533,8 +2535,8 @@ test("fetchChats keeps unread chats when preview lookup fails", async (t) => {
   const triage = createTriage({ workiq, statePath: join(stateRoot, "state.json") });
   const result = await triage.refresh();
   assert.deepEqual(result.errors, []);
-  assert.equal(result.items.length, 2);
-  assert.ok(result.items.every((item) => item.summary === "Unread message in Teams"));
+  assert.equal(result.items.length, 0);
+  assert.ok(result.items.every((item) => item.summary !== "Unread message in Teams"));
 });
 
 test("Teams detail falls back to the item summary without a warning when WorkIQ returns 429 or 500", async (t) => {
@@ -3877,4 +3879,466 @@ test("calendarDetail falls back to the loaded agenda when WorkIQ rate limits the
   assert.equal(detail.cached, null);
   assert.equal(detail.warning, null);
   assert.equal(detail.item.eventId, "event-1");
+});
+
+const mcpResult = (payload) => ({ structuredContent: payload });
+
+test("unwrapMcpServerResult decodes the mail rawResponse envelope with paging fields", () => {
+  const rawResponse = JSON.stringify({ "@odata.context": "ctx", value: [{ id: "m1" }, { id: "m2" }] });
+  const decoded = unwrapMcpServerResult(
+    mcpResult({ rawResponse, hasMoreResults: true, nextLink: "https://graph.microsoft.com/v1.0/me/messages?$skip=2" }),
+    "mail.SearchMessagesQueryParameters",
+  );
+  assert.deepEqual(decoded.value.map((record) => record.id), ["m1", "m2"]);
+  assert.equal(decoded.hasMoreResults, true);
+  assert.equal(decoded.nextLink, "https://graph.microsoft.com/v1.0/me/messages?$skip=2");
+
+  const fromText = unwrapMcpServerResult(
+    { content: [{ type: "text", text: JSON.stringify({ rawResponse: { id: "m3" } }) }] },
+    "mail.GetMessage",
+  );
+  assert.deepEqual(fromText, { id: "m3" });
+  assert.deepEqual(unwrapMcpServerResult(mcpResult({ chats: [] }), "teams.ListChats"), { chats: [] });
+  assert.throws(() => unwrapMcpServerResult(null, "teams.ListChats"), { code: "workiq_empty" });
+  assert.throws(
+    () => unwrapMcpServerResult({ isError: true, content: [{ type: "text", text: "HTTP 429 TooManyRequests" }] }, "teams.ListChats"),
+    (error) => error.code === "workiq_error" && error.rateLimited === true && /^teams\.ListChats: /.test(error.message),
+  );
+});
+
+test("host adapter routes teams and mail calls to their own MCP servers and falls back when absent", async () => {
+  const calls = [];
+  const toolsByServer = {
+    workiq: WORKIQ_REQUIRED_TOOLS,
+    teams: ["ListChats", "ListChatMessages"],
+    mail: ["SearchMessagesQueryParameters"],
+  };
+  const workiq = createWorkIqHostAdapter({
+    listTools: async ({ serverName, originServerName }) => {
+      calls.push(["list", serverName, originServerName]);
+      if (!toolsByServer[serverName]) throw new Error(`Unknown MCP server ${serverName}`);
+      return { tools: toolsByServer[serverName].map((name) => ({ name })) };
+    },
+    callTool: async ({ serverName, originServerName, toolName, arguments: args }) => {
+      calls.push(["call", serverName, originServerName, toolName, args]);
+      if (serverName === "mail") {
+        return mcpResult({ rawResponse: JSON.stringify({ value: [{ id: "m1" }] }), hasMoreResults: false });
+      }
+      return mcpResult({ chats: [{ id: "c1" }], messages: [{ id: "x" }] });
+    },
+  });
+  assert.equal(await workiq.hasServerTool("teams", "ListChats"), true);
+  assert.equal(await workiq.hasServerTool("teams", "UpdateChat"), false);
+  assert.equal(await workiq.hasServerTool("calendar", "ListEvents"), false, "an unexposed server is unavailable, not fatal");
+  assert.deepEqual((await workiq.teamsListChats()).chats, [{ id: "c1" }]);
+  assert.deepEqual((await workiq.teamsListChatMessages({ chatId: "c1", top: 5 })).messages, [{ id: "x" }]);
+  assert.equal((await workiq.mailSearchMessages({ queryParameters: "?$top=1" })).value[0].id, "m1");
+  await assert.rejects(workiq.teamsUpdateChat({ chatId: "c1", action: "markRead" }), { code: "mcp_tool_unavailable" });
+  assert.deepEqual(calls.filter((entry) => entry[0] === "call"), [
+    ["call", "teams", "teams", "ListChats", { fetchAllPages: false }],
+    ["call", "teams", "teams", "ListChatMessages", { chatId: "c1", top: 5 }],
+    ["call", "mail", "mail", "SearchMessagesQueryParameters", { queryParameters: "?$top=1" }],
+  ]);
+  assert.ok(calls.some((entry) => entry[0] === "list" && entry[1] === "teams" && entry[2] === "teams"));
+
+  const rawCalls = [];
+  const rawAdapter = createWorkIqHostAdapter({
+    listTools: async (params) => {
+      rawCalls.push(params);
+      return toolList();
+    },
+    callTool: async (params) => {
+      rawCalls.push(params);
+      return okFetch;
+    },
+  });
+  await rawAdapter.rawListTools({ serverName: "teams" });
+  await rawAdapter.rawCallTool({ serverName: "mail", toolName: "GetMessage", arguments: { id: "1" } });
+  await rawAdapter.rawCallTool({ toolName: "fetch" });
+  assert.deepEqual(rawCalls, [
+    { serverName: "teams", originServerName: "teams" },
+    { serverName: "mail", originServerName: "mail", toolName: "GetMessage", arguments: { id: "1" } },
+    { serverName: "workiq", originServerName: "workiq", toolName: "fetch", arguments: {} },
+  ]);
+
+  const missing = createWorkIqHostAdapter({
+    listTools: async ({ serverName }) => {
+      if (serverName !== "workiq") throw new Error("Unknown MCP server");
+      return toolList();
+    },
+    callTool: async () => okFetch,
+  });
+  assert.equal(await missing.hasServerTool("teams", "ListChats"), false);
+  assert.equal(await missing.hasServerTool("workiq", "fetch"), true);
+});
+
+test("host adapter reaches the teams and mail servers through the peer bridge", async (t) => {
+  const statePath = await stateFile(t);
+  const bridgePath = join(statePath, "..", "bridge.json");
+  const primaryCalls = [];
+  const primary = createWorkIqHostAdapter({
+    listTools: async ({ serverName }) => ({
+      tools: (serverName === "workiq" ? WORKIQ_REQUIRED_TOOLS : serverName === "mail" ? ["SearchMessagesQueryParameters"] : ["ListChats"])
+        .map((name) => ({ name })),
+    }),
+    callTool: async (params) => {
+      primaryCalls.push(params);
+      if (params.serverName === "mail") return mcpResult({ rawResponse: JSON.stringify({ value: [{ id: "bridged" }] }) });
+      if (params.serverName === "teams") return mcpResult({ chats: [{ id: "bridged-chat" }] });
+      return okFetch;
+    },
+  });
+  const server = await createTriage({ workiq: primary, statePath }).startServer();
+  t.after(() => server.close());
+  await primary.fetch(["/me?$select=id"]);
+  for (let i = 0; i < 20; i++) {
+    try {
+      await readFile(bridgePath, "utf8");
+      break;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    }
+  }
+  const standalone = createWorkIqHostAdapter({
+    bridgePath,
+    listTools: async () => {
+      throw new Error("MCP host is not available on this session");
+    },
+    callTool: async () => {
+      throw new Error("MCP host is not available on this session");
+    },
+  });
+  assert.equal(await standalone.hasServerTool("mail", "SearchMessagesQueryParameters"), true);
+  assert.equal((await standalone.mailSearchMessages({ queryParameters: "?$top=1" })).value[0].id, "bridged");
+  assert.equal((await standalone.teamsListChats()).chats[0].id, "bridged-chat");
+  assert.ok(primaryCalls.some((call) => call.serverName === "mail" && call.toolName === "SearchMessagesQueryParameters"));
+  assert.ok(primaryCalls.some((call) => call.serverName === "teams" && call.toolName === "ListChats"));
+});
+
+function mcpTeamsWorkiq({ chats, messages, calls = [] }) {
+  return {
+    hasServerTool: async (server, tool) =>
+      server === "teams" && ["ListChats", "ListChatMessages", "UpdateChat"].includes(tool),
+    teamsListChats: async (args) => {
+      calls.push(["ListChats", args]);
+      return { chats, totalScanned: chats.length, hasMoreResults: false };
+    },
+    teamsListChatMessages: async (args) => {
+      calls.push(["ListChatMessages", args]);
+      return { messages: messages[args.chatId] ?? [] };
+    },
+    teamsUpdateChat: async (args) => {
+      calls.push(["UpdateChat", args]);
+      return {};
+    },
+    fetch: async ([path]) => {
+      if (path.startsWith("/me?")) return { results: [{ statusCode: 404, error: "unavailable" }] };
+      return emptyInbox;
+    },
+    update: async () => ({}),
+    action: async () => ({}),
+  };
+}
+
+const flatChat = (id, overrides = {}) => ({
+  id,
+  chatType: "oneOnOne",
+  topic: null,
+  hasUnreadMessages: true,
+  lastMessagePreview: {
+    body: "Hi there",
+    from: { displayName: "Taylor Kim", id: "user-taylor" },
+    createdDateTime: "2026-01-15T17:00:00Z",
+  },
+  ...overrides,
+});
+
+test("fetchChats replaces a legacy persisted preview message with real teams MCP messages", async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "triage-mcp-"));
+  t.after(() => rm(stateRoot, { recursive: true, force: true }));
+  const calls = [];
+  const workiq = mcpTeamsWorkiq({
+    calls,
+    chats: [flatChat("chat-1")],
+    messages: {
+      "chat-1": [
+        {
+          id: "m2",
+          messageType: "message",
+          createdDateTime: "2026-01-15T17:00:00Z",
+          from: { displayName: "Taylor Kim", id: "user-taylor" },
+          body: { contentType: "text", content: "Real message" },
+        },
+      ],
+    },
+  });
+  const triage = createTriage({ workiq, statePath: join(stateRoot, "state.json") });
+  await triage.setItems([
+    {
+      source: "teams",
+      chatId: "chat-1",
+      title: "Taylor Kim",
+      sender: "Taylor Kim",
+      summary: "Hi there",
+      receivedAt: "2026-01-15T17:00:00Z",
+      messages: [
+        { id: "preview-teams-legacy", from: "Taylor Kim", body: "Hi there", blocks: [], replyTo: [], attachments: [] },
+        { id: "placeholder", from: "Teams message", body: "Unread message in Teams", blocks: [], replyTo: [], attachments: [] },
+      ],
+    },
+  ]);
+  const result = await triage.refresh();
+  assert.deepEqual(result.errors, []);
+  const [item] = result.items.filter((entry) => entry.source === "teams");
+  assert.deepEqual(item.messages.map((message) => message.id), ["m2"]);
+  assert.equal(item.messages[0].from, "Taylor Kim");
+  assert.deepEqual(calls.find((call) => call[0] === "ListChats")[1], { fetchAllPages: false });
+  assert.deepEqual(calls.find((call) => call[0] === "ListChatMessages")[1], {
+    chatId: "chat-1",
+    top: 20,
+    include: "attachments,reactions",
+  });
+});
+
+test("fetchChats drops chats whose messages are all system events instead of synthesizing a placeholder", async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "triage-mcp-"));
+  t.after(() => rm(stateRoot, { recursive: true, force: true }));
+  const system = (id) => ({
+    id,
+    messageType: "message",
+    createdDateTime: "2026-01-15T17:00:00Z",
+    from: null,
+    body: { contentType: "html", content: "<systemEventMessage/>" },
+  });
+  const workiq = mcpTeamsWorkiq({
+    chats: [
+      flatChat("meeting-1", {
+        chatType: "meeting",
+        topic: "Weekly sync",
+        lastMessagePreview: { body: "<systemEventMessage/>", from: null, createdDateTime: "2026-01-15T17:00:00Z" },
+      }),
+      flatChat("meeting-2", { chatType: "meeting", topic: "Empty meeting", lastMessagePreview: null }),
+    ],
+    messages: { "meeting-1": [system("s1"), system("s2")] },
+  });
+  const triage = createTriage({ workiq, statePath: join(stateRoot, "state.json") });
+  const result = await triage.refresh();
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(result.items.filter((entry) => entry.source === "teams"), []);
+});
+
+test("legacy persisted Teams placeholders are cleaned when state loads", async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "triage-legacy-"));
+  t.after(() => rm(stateRoot, { recursive: true, force: true }));
+  const statePath = join(stateRoot, "state.json");
+  const message = (id, body) => ({ id, from: "Taylor Kim", body, blocks: [], replyTo: [], attachments: [] });
+  const base = { status: "fyi", receivedAt: "2026-01-15T17:00:00Z", sender: "", title: "Chat" };
+  const seed = createTriage({ workiq: mcpTeamsWorkiq({ chats: [], messages: {} }), statePath });
+  await seed.setItems([]);
+  const { writeFile } = await import("node:fs/promises");
+  await writeFile(
+    statePath,
+    JSON.stringify({
+      items: [
+        { ...base, id: "teams-a", source: "teams", rawId: "a", chatId: "a", summary: "Unread message in Teams", messages: [message("preview-teams-a", "Unread message in Teams")] },
+        { ...base, id: "teams-b", source: "teams", rawId: "b", chatId: "b", summary: "Real", messages: [message("m1", "Real"), message("preview-b", "Unread message in Teams")] },
+      ],
+      calendarEvents: [],
+    }),
+  );
+  const fresh = createTriage({ workiq: mcpTeamsWorkiq({ chats: [], messages: {} }), statePath });
+  const { items } = await fresh.getItems();
+  assert.deepEqual(items.map((entry) => entry.id), ["teams-b"]);
+  assert.deepEqual(items[0].messages.map((entry) => entry.id), ["m1"]);
+});
+
+test("flat teams MCP senders, bot fallbacks, image-only messages, and sibling replies are normalized", async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "triage-flat-"));
+  t.after(() => rm(stateRoot, { recursive: true, force: true }));
+  const profile = {
+    fetch: async ([path]) =>
+      path.startsWith("/me?")
+        ? { results: [{ statusCode: 200, data: { id: "me-id", displayName: "Jordan Lee", mail: "jordan.lee@fabrikam.com" } }] }
+        : emptyInbox,
+    update: async () => ({}),
+    action: async () => ({}),
+  };
+  await createTriage({ workiq: profile, statePath: join(stateRoot, "state.json") }).refresh();
+
+  const preview = (from, extra = {}) => ({
+    id: "c",
+    hasUnreadMessages: true,
+    lastMessagePreview: { body: "hello", from, createdDateTime: "2026-01-15T17:00:00Z", ...extra },
+  });
+  assert.equal(normalizeWorkIqChat(preview({ displayName: "Jordan Lee", id: "x" })).hasUnreadMessages, false);
+  assert.equal(normalizeWorkIqChat(preview({ displayName: "Someone", id: "ME-ID" }), { currentUserId: "me-id" }).hasUnreadMessages, false);
+  assert.equal(normalizeWorkIqChat(preview({ displayName: "Taylor Kim", id: "t" }), { currentUserId: "me-id" }).hasUnreadMessages, true);
+  assert.equal(normalizeWorkIqChat(preview({ user: { displayName: "Jordan Lee", id: "me-id" } })).hasUnreadMessages, false);
+  assert.equal(normalizeWorkIqChat(preview({ displayName: "Taylor Kim" })).lastMessagePreview.from, "Taylor Kim");
+  assert.equal(normalizeWorkIqChat({ id: "m", hasUnreadMessages: true, lastMessagePreview: null }).hasUnreadMessages, false);
+  assert.equal(
+    normalizeWorkIqChat({ id: "m", hasUnreadMessages: true, lastMessagePreview: { body: "x", from: "Bot" } }).hasUnreadMessages,
+    true,
+  );
+  assert.equal(
+    normalizeWorkIqChat({
+      id: "g",
+      lastUpdatedDateTime: "2026-01-15T18:00:00Z",
+      viewpoint: { lastMessageReadDateTime: "2026-01-15T16:00:00Z" },
+      lastMessagePreview: { body: { content: "x" }, from: { user: { displayName: "Taylor Kim" } }, createdDateTime: "2026-01-15T17:00:00Z" },
+    }).hasUnreadMessages,
+    true,
+  );
+
+  const flat = normalizeTeamsDetailMessage(
+    { id: "m1", from: { displayName: "Taylor Kim", id: "USER-1" }, body: { contentType: "text", content: "Hello" } },
+    "user-1",
+  );
+  assert.equal(flat.from, "Taylor Kim");
+  assert.equal(flat.senderId, "user-1");
+  assert.equal(flat.isMe, true);
+
+  const bot = normalizeTeamsDetailMessage(
+    { id: "b1", from: null, body: { contentType: "html", content: "<p>Build passed</p>" } },
+    null,
+    { fallbackSender: "Release Bot" },
+  );
+  assert.equal(bot.from, "Release Bot");
+  assert.equal(bot.isMe, false);
+
+  const image = normalizeTeamsDetailMessage({
+    id: "i1",
+    from: { displayName: "Taylor Kim" },
+    body: { contentType: "html", content: '<p><img src="https://example.com/a.png" alt=""></p>' },
+  });
+  assert.equal(image.body, "Shared an image");
+  assert.equal(image.blocks[0].text, "Shared an image");
+  assert.equal(image.attachments[0].contentType, "image");
+
+  const original = { id: "orig", from: { displayName: "Casey Ng" }, body: { contentType: "html", content: "<p>Original question</p>" } };
+  const sibling = normalizeTeamsDetailMessage(
+    {
+      id: "r1",
+      from: { displayName: "Taylor Kim" },
+      body: { contentType: "html", content: '<attachment id="orig"></attachment>Thanks!' },
+    },
+    null,
+    { messageById: new Map([["orig", original]]) },
+  );
+  assert.deepEqual(sibling.replyTo, [{ id: "orig", sender: "Casey Ng", preview: "Original question" }]);
+  assert.equal(sibling.body, "Thanks!");
+
+  const latest = resolveChatPreview([
+    { id: "s", from: null, body: { content: "<systemEventMessage/>" } },
+    { id: "p", from: { displayName: "Taylor Kim" }, createdDateTime: "t", body: { contentType: "html", content: "<img src='https://example.com/a.png'>" } },
+  ]);
+  assert.deepEqual(latest, { body: "Shared an image", from: "Taylor Kim", createdDateTime: "t" });
+  assert.equal(isDeletedOrSystemMessage({ body: { content: "<systemEventMessage/>" } }), true);
+  assert.equal(isDeletedOrSystemMessage({ body: { content: "<p>hi</p>" } }), false);
+});
+
+test("stripText strips tags before decoding entities", () => {
+  assert.equal(stripText("Fish &amp; Chips"), "Fish & Chips");
+  assert.equal(stripText("&lt;script&gt;x&lt;/script&gt;"), "<script>x</script>");
+  assert.equal(stripText("<style>p{color:red}</style><p>Hi &nbsp;there</p><script>alert(1)</script>"), "Hi there");
+});
+
+test("mail and teams actions use the dedicated MCP servers when exposed", async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "triage-mail-mcp-"));
+  t.after(() => rm(stateRoot, { recursive: true, force: true }));
+  const calls = [];
+  const page = (ids, nextLink) => ({
+    value: ids.map(([id, receivedDateTime]) => ({
+      id,
+      subject: `Subject ${id}`,
+      receivedDateTime,
+      from: { emailAddress: { name: "Sample User", address: "sample@contoso.com" } },
+      bodyPreview: "Can you review?",
+    })),
+    ...(nextLink ? { hasMoreResults: true, nextLink } : { hasMoreResults: false }),
+  });
+  const workiq = {
+    hasServerTool: async (server, tool) => server === "mail" || (server === "teams" && ["SendMessageToChat", "UpdateChat"].includes(tool)),
+    mailSearchMessages: async (args) => {
+      calls.push(["search", args]);
+      return args.nextLink ? page([["m3", "2026-01-15T12:00:00Z"], ["m1", "2026-01-15T10:00:00Z"]]) : page([["m1", "2026-01-15T10:00:00Z"], ["m2", "2026-01-15T11:00:00Z"]], "next-link");
+    },
+    mailGetMessage: async (args) => {
+      calls.push(["get", args]);
+      return {
+        id: args.id,
+        subject: "Hello",
+        body: { contentType: "html", content: "<p>Body</p>" },
+        from: { emailAddress: { name: "Sample User", address: "sample@contoso.com" } },
+        toRecipients: [],
+        ccRecipients: [],
+        replyTo: [],
+        receivedDateTime: "2026-01-15T11:00:00Z",
+        hasAttachments: true,
+      };
+    },
+    mailGetAttachments: async (args) => {
+      calls.push(["attachments", args]);
+      return { value: [{ id: "a1", name: "plan.pdf", contentType: "application/pdf", size: 10 }] };
+    },
+    mailReplyToMessage: async (args) => calls.push(["reply", args]),
+    mailReplyAllToMessage: async (args) => calls.push(["replyAll", args]),
+    mailForwardMessage: async (args) => calls.push(["forward", args]),
+    mailDeleteMessage: async (args) => calls.push(["delete", args]),
+    teamsSendMessageToChat: async (args) => {
+      calls.push(["send", args]);
+      return { id: "sent-1" };
+    },
+    teamsUpdateChat: async (args) => calls.push(["updateChat", args]),
+    fetch: async ([path]) => {
+      calls.push(["fetch", path]);
+      return path.startsWith("/me?") ? { results: [{ statusCode: 404, error: "unavailable" }] } : emptyInbox;
+    },
+    update: async (...args) => calls.push(["update", ...args]),
+    action: async (...args) => {
+      calls.push(["action", ...args]);
+      return {};
+    },
+  };
+  const triage = createTriage({ workiq, statePath: join(stateRoot, "state.json") });
+  const result = await triage.refresh();
+  const emails = result.items.filter((entry) => entry.source === "email");
+  assert.deepEqual(emails.map((entry) => entry.rawId), ["m3", "m2", "m1"], "paged, deduplicated, and sorted newest first");
+  const [firstSearch, secondSearch] = calls.filter((call) => call[0] === "search").map((call) => call[1]);
+  assert.match(firstSearch.queryParameters, /^\?\$filter=isRead eq false&\$select=.+&\$top=50$/);
+  assert.ok(!firstSearch.queryParameters.includes("$orderby"));
+  assert.deepEqual(secondSearch, { nextLink: "next-link" });
+
+  const detail = await triage.getDetail(emails[0].id);
+  assert.equal(detail.attachments[0].name, "plan.pdf");
+  assert.deepEqual(calls.find((call) => call[0] === "get")[1], { id: "m3", preferHtml: true });
+
+  await triage.reply(emails[0].id, { body: "Thanks", mode: "reply" });
+  await triage.reply(emails[1].id, { body: "All", mode: "replyAll" });
+  await assert.rejects(triage.reply(emails[2].id, { body: "FYI", mode: "forward", to: "not-an-address" }), { code: "invalid_recipients" });
+  await triage.reply(emails[2].id, { body: "FYI", mode: "forward", to: "a@contoso.com; b@contoso.com" });
+  assert.deepEqual(calls.find((call) => call[0] === "reply")[1], { id: "m3", comment: "Thanks", sendImmediately: true });
+  assert.deepEqual(calls.find((call) => call[0] === "replyAll")[1], { id: "m2", comment: "All", sendImmediately: true });
+  assert.deepEqual(calls.find((call) => call[0] === "forward")[1], {
+    messageId: "m1",
+    introComment: "FYI",
+    additionalTo: ["a@contoso.com", "b@contoso.com"],
+  });
+  assert.ok(!calls.some((call) => call[0] === "action"), "no Graph action is used when the mail server is exposed");
+
+  const [deletable] = (await triage.setItems([{ source: "email", messageId: "del-1", title: "Delete me" }], "merge")).items.filter(
+    (entry) => entry.rawId === "del-1",
+  );
+  await triage.deleteItem(deletable.id);
+  assert.deepEqual(calls.find((call) => call[0] === "delete")[1], { id: "del-1" });
+
+  const [chat] = (await triage.setItems([{ source: "teams", chatId: "chat-9", title: "Chat", summary: "Hello", status: "fyi" }], "merge")).items.filter(
+    (entry) => entry.rawId === "chat-9",
+  );
+  const sent = await triage.reply(chat.id, { body: "On it" });
+  assert.equal(sent.sentMessage.id, "sent-1");
+  assert.deepEqual(calls.find((call) => call[0] === "send")[1], { chatId: "chat-9", content: "On it" });
+  await triage.dismiss(chat.id);
+  assert.ok(calls.filter((call) => call[0] === "updateChat").every(([, args]) => args.chatId === "chat-9" && args.action === "markRead"));
+  assert.ok(calls.filter((call) => call[0] === "updateChat").length >= 2, "reply and dismiss both mark the chat read");
 });
