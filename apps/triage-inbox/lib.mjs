@@ -208,7 +208,8 @@ export function stripText(value, max = 360) {
         : d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "UTC" });
     })
     .replace(/&nbsp;|\u00a0/g, " ")
-    .replace(/\[([^\]\n]{1,200})\]\((?:https?:\/\/|mailto:)[^)\s]*\)/gi, "$1")
+    .replace(/_{5,}/g, " ")
+    .replace(/\[((?:[^[\]\n]|\[[^\]\n]*\]){1,240})\]\((?:https?:\/\/|mailto:)[^)\s]*\)/gi, "$1")
     .replace(/\*\*([^*\n]+)\*\*/g, "$1")
     .replace(/\s+/g, " ")
     .trim();
@@ -2795,7 +2796,7 @@ function briefingText(result) {
 
 function citationsFromText(text) {
   const links = [];
-  for (const match of String(text).matchAll(/\[([^\]\n]{1,120})\]\((https:\/\/[^)\s]+)\)/g)) {
+  for (const match of String(text).matchAll(/\[((?:[^[\]\n]|\[[^\]\n]*\]){1,240})\]\((https:\/\/[^)\s]+)\)/g)) {
     const url = safeLink(match[2]);
     if (url && !links.some((link) => link.url === url)) links.push({ kind: "related", label: stripText(match[1], 120), url });
     if (links.length >= 8) break;
@@ -2822,7 +2823,7 @@ export function shapeWorkIqAnswer(text, { prompt, conversationId = null, now = n
     citations: citationsFromText(raw),
     draft: raw
       .replace(/\[\^[^\]]*\]/g, "")
-      .replace(/\[([^\]\n]{1,120})\]\((https:\/\/[^)\s]+)\)/g, "$1 ($2)")
+      .replace(/\[((?:[^[\]\n]|\[[^\]\n]*\]){1,240})\]\((https:\/\/[^)\s]+)\)/g, "$1 ($2)")
       .replace(/\*\*([^*\n]+)\*\*/g, "$1")
       .replace(/[ \t]+\n/g, "\n")
       .trim(),

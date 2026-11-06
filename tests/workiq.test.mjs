@@ -2730,6 +2730,14 @@ const postJson = (server, path, body) =>
 test("stripText flattens Markdown links and bold so bot summaries read as plain text", () => {
   assert.equal(stripText("[PR #12](https://github.com/contoso/app/pull/12) merged **now**"), "PR #12 merged now");
   assert.equal(
+    stripText("[{int} SDP PaaS Capacity - weekly sync [The EugeniuSEs]](https://teams.microsoft.com/l/message/19:meeting_abc)"),
+    "{int} SDP PaaS Capacity - weekly sync [The EugeniuSEs]",
+  );
+  assert.equal(
+    stripText("Agenda item ________________________________________________________________________________ Microsoft Teams"),
+    "Agenda item Microsoft Teams",
+  );
+  assert.equal(
     classifyChat({
       id: "bot-chat",
       hasUnreadMessages: true,
