@@ -274,7 +274,7 @@ function buildFilters() {
     button.onclick = () => {
       filter = key;
       updateFilters();
-      renderList();
+      reconcileVisibleSelection();
     };
     filterEls.set(key, { button, count });
     bar.append(button);
@@ -304,7 +304,7 @@ function buildRoles() {
     button.onclick = () => {
       roleFilter = roleFilter === role ? null : role;
       updateRoles();
-      renderList();
+      reconcileVisibleSelection();
     };
     roleEls.set(role, { button, count });
     bar.append(button);
@@ -518,8 +518,9 @@ function toggleItem(item) {
   else selectItem(item);
 }
 
-async function selectItem(item) {
+async function selectItem(item, { publish = true } = {}) {
   if (!item || pending.has(item.id)) return;
+  const previousId = selectedId;
   clearTimeout(detailRetryTimer);
   detailRetryTimer = null;
   selectedId = item.id;
@@ -531,6 +532,16 @@ async function selectItem(item) {
   renderList();
   renderDetailHeader(item);
   showDetailLoading();
+  if (publish) {
+    const published = await publishSelection(item.id);
+    if (seq !== detailSeq || selectedId !== item.id) return;
+    if (!published) {
+      const previous = itemById(previousId);
+      if (previous && visible().some((entry) => entry.id === previous.id)) await selectItem(previous, { publish: false });
+      else backToQueue({ publish: false });
+      return;
+    }
+  }
   try {
     const result = await post("/api/detail", { id: item.id });
     if (seq !== detailSeq || selectedId !== item.id) return;
@@ -544,6 +555,16 @@ async function selectItem(item) {
     if (seq !== detailSeq || selectedId !== item.id) return;
     showDetailError(error);
     setStatus(`Detail failed: ${error.message}`, true);
+  }
+}
+
+async function publishSelection(id) {
+  try {
+    await post("/api/selection", { id });
+    return true;
+  } catch (error) {
+    setStatus(`Could not update selection: ${error.message}`, true);
+    return false;
   }
 }
 
@@ -1845,6 +1866,11 @@ function syncPane() {
   $("agendaToggle").setAttribute("aria-pressed", String(!open && agendaOpenNarrow));
 }
 
+function reconcileVisibleSelection() {
+  if (selectedId && !visible().some((item) => item.id === selectedId)) backToQueue();
+  else renderList();
+}
+
 function setAgendaNarrow(on) {
   agendaOpenNarrow = on;
   syncPane();
@@ -2584,12 +2610,20 @@ function renderIntel() {
   root.replaceChildren(...nodes);
 }
 
-function backToQueue() {
+function backToQueue({ publish = true } = {}) {
   clearTimeout(detailRetryTimer);
   detailRetryTimer = null;
+  const previous = itemById(selectedId);
   detailSeq++;
   intelSeq++;
   selectedId = null;
+  if (publish) {
+    void publishSelection(null).then((published) => {
+      if (!published && selectedId === null && previous && visible().some((item) => item.id === previous.id)) {
+        void selectItem(previous, { publish: false });
+      }
+    });
+  }
   detail = null;
   intel = null;
   $("detailContent").replaceChildren();
@@ -2738,6 +2772,7 @@ function animateOut(item, message) {
 }
 
 function setState(state) {
+  const serverSelectionKnown = Object.hasOwn(state, "selectedItemId");
   items = state.items ?? [];
   updatedAt = state.updatedAt;
   calendarEvents = Array.isArray(state.calendarEvents) ? state.calendarEvents : calendarEvents;
@@ -2746,7 +2781,16 @@ function setState(state) {
   loaded = true;
   updateSync();
   renderList();
-  if (selectedId && !itemById(selectedId)) backToQueue();
+  if (serverSelectionKnown && state.selectedItemId !== selectedId) {
+    const selected = state.selectedItemId ? itemById(state.selectedItemId) : null;
+    if (selected && visible().some((item) => item.id === selected.id)) {
+      void selectItem(selected, { publish: false });
+    } else {
+      backToQueue({ publish: false });
+      if (state.selectedItemId) void publishSelection(null);
+    }
+  }
+  if (selectedId && (!itemById(selectedId) || !visible().some((item) => item.id === selectedId))) backToQueue();
   else if (selectedId === null) renderAgenda();
   if (!agendaLoaded && !agendaAutoTried) {
     agendaAutoTried = true;
@@ -2791,7 +2835,7 @@ $("briefingForm").onsubmit = (event) => {
 };
 search.oninput = () => {
   query = search.value;
-  renderList();
+  reconcileVisibleSelection();
 };
 
 const FEED_WIDTH_KEY = "triage-inbox.feedWidth";

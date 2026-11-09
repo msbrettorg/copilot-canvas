@@ -108,7 +108,7 @@ class FakeElement extends FakeNode {
 
 async function loadApp() {
   const source = await readFile(new URL("../apps/triage-inbox/web/app.js", import.meta.url), "utf8");
-  const initAt = source.indexOf("buildFilters();\nbuildRoles();");
+  const initAt = source.search(/buildFilters\(\);\r?\nbuildRoles\(\);/);
   assert.ok(initAt > 0, "app.js init block moved");
   const byId = new Map();
   const document = {
@@ -146,13 +146,18 @@ globalThis.__app = {
   root: (id) => $(id),
   state: {
     setItems(next) { items = next; },
+    applyServerState(next) { setState(next); },
     setPost(fn) { post = fn; },
+    setFilter(next) { filter = next; reconcileVisibleSelection(); },
+    selectedId: () => selectedId,
     stubChrome() {
       renderList = () => {};
       syncPane = () => {};
+      renderAgenda = () => {};
       renderDetail = () => {};
       renderDetailHeader = () => {};
       showDetailLoading = () => {};
+      setStatus = () => {};
     },
     intel: () => intel,
   },
@@ -436,4 +441,80 @@ test("selecting an item reads local intel only, and X-Ray fetches the directory 
   const after = calls.filter((call) => call.path === "/api/intel");
   assert.equal(after.length, 2);
   assert.equal(after[1].body.localOnly, false);
+  assert.deepEqual(
+    calls.filter((call) => call.path === "/api/selection").map((call) => call.body.id),
+    ["item-1"],
+  );
+});
+
+test("filtering out the selected item clears the reading-pane selection", async () => {
+  const app = await loadApp();
+  const calls = [];
+  const selected = { id: "item-1", source: "email", sender: "Sample Sender", title: "Plan", status: "action" };
+  const hidden = { id: "item-2", source: "teams", sender: "Sample Team", title: "Chat", status: "action" };
+  app.state.setItems([selected, hidden]);
+  app.state.stubChrome();
+  app.state.setPost(async (path, body) => {
+    calls.push({ path, body });
+    if (path === "/api/detail") {
+      return { id: selected.id, source: selected.source, item: selected, blocks: [], attachments: [] };
+    }
+    return {};
+  });
+
+  await app.selectItem(selected);
+  app.state.setFilter("teams");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(app.state.selectedId(), null);
+  assert.deepEqual(
+    calls.filter((call) => call.path === "/api/selection").map((call) => call.body.id),
+    [selected.id, null],
+  );
+});
+
+test("selection publication failure restores the server-selected item", async () => {
+  const app = await loadApp();
+  const first = { id: "item-1", source: "email", sender: "Sample Sender", title: "First", status: "action" };
+  const second = { id: "item-2", source: "email", sender: "Sample Sender", title: "Second", status: "action" };
+  app.state.setItems([first, second]);
+  app.state.stubChrome();
+  app.state.setPost(async (path, body) => {
+    if (path === "/api/selection" && body.id === second.id) throw new Error("selection failed");
+    if (path === "/api/detail") {
+      const item = body.id === first.id ? first : second;
+      return { id: item.id, source: item.source, item, blocks: [], attachments: [] };
+    }
+    return {};
+  });
+
+  await app.selectItem(first);
+  await app.selectItem(second);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(app.state.selectedId(), first.id);
+});
+
+test("an incoming server snapshot restores the reading pane selection", async () => {
+  const app = await loadApp();
+  const item = { id: "item-1", source: "email", sender: "Sample Sender", title: "Plan", status: "action" };
+  app.state.setItems([item]);
+  app.state.stubChrome();
+  app.state.setPost(async (path) => {
+    if (path === "/api/detail") return { id: item.id, source: item.source, item, blocks: [], attachments: [] };
+    return {};
+  });
+
+  app.state.applyServerState({
+    items: [item],
+    updatedAt: null,
+    calendarEvents: [],
+    agendaUpdatedAt: null,
+    agendaLoaded: true,
+    selectedItemId: item.id,
+    selectedItem: item,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(app.state.selectedId(), item.id);
 });

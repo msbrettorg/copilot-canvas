@@ -2844,6 +2844,7 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
   let activeMutations = 0;
   let loading = null;
   let currentUserId = null;
+  let selectedItemId = null;
   let mutationQueue = Promise.resolve();
 
   function mutate(operation) {
@@ -2934,17 +2935,43 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
     return loading;
   }
 
-  const snapshot = () => ({
-    items: state.items,
-    updatedAt: state.updatedAt,
-    calendarEvents: state.calendarEvents ?? [],
-    agendaUpdatedAt: state.agendaUpdatedAt ?? null,
-    agendaLoaded: Boolean(state.agendaLoaded),
-  });
+  function reconcileSelection() {
+    if (selectedItemId && !state.items.some((item) => item.id === selectedItemId)) {
+      selectedItemId = null;
+    }
+  }
+
+  const snapshot = () => {
+    reconcileSelection();
+    const selectedItem = selectedItemId
+      ? state.items.find((item) => item.id === selectedItemId) ?? null
+      : null;
+    return {
+      items: state.items,
+      updatedAt: state.updatedAt,
+      calendarEvents: state.calendarEvents ?? [],
+      agendaUpdatedAt: state.agendaUpdatedAt ?? null,
+      agendaLoaded: Boolean(state.agendaLoaded),
+      selectedItemId: selectedItem?.id ?? null,
+      selectedItem,
+    };
+  };
 
   async function getItems() {
     await load();
     return snapshot();
+  }
+
+  async function setSelection(id) {
+    return mutate(async () => {
+      await load();
+      if (id !== null && !state.items.some((item) => item.id === id)) {
+        throw new TriageError("not_found", `No item with id ${id}`);
+      }
+      selectedItemId = id;
+      broadcast("state", snapshot());
+      return snapshot();
+    });
   }
 
   const person = (recipient) => {
@@ -4795,6 +4822,10 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
         return;
       }
       if (url.pathname === "/api/detail") return sendJson(res, 200, await getDetail(String(body.id), { forceRefresh: body.forceRefresh === true }));
+      if (url.pathname === "/api/selection") {
+        const id = body.id == null ? null : String(body.id);
+        return sendJson(res, 200, await setSelection(id));
+      }
       if (url.pathname === "/api/refresh") return sendJson(res, 200, await refresh());
       if (url.pathname === "/api/agenda") return sendJson(res, 200, await refreshAgenda());
       if (url.pathname === "/api/intel") return sendJson(res, 200, await getItemIntel(body));
@@ -4897,6 +4928,7 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
 
   return {
     getItems,
+    setSelection,
     setItems,
     refresh,
     fetchAgenda,

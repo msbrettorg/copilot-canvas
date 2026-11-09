@@ -731,6 +731,48 @@ test("dismiss keeps the item when WorkIQ rejects the write", async (t) => {
   assert.equal((await triage.getItems()).items.length, 1);
 });
 
+test("selection snapshots follow selection changes and reset when the selected item is removed", async (t) => {
+  const statePath = await stateFile(t);
+  const triage = createTriage({
+    workiq: {
+      update: async () => ({}),
+    },
+    statePath,
+  });
+  const initial = await triage.setItems([
+    { source: "email", messageId: "message-1", title: "First", status: "action" },
+    { source: "email", messageId: "message-2", title: "Second", status: "action" },
+  ]);
+  assert.equal(initial.selectedItemId, null);
+  assert.equal(initial.selectedItem, null);
+
+  const selected = await triage.setSelection(initial.items[0].id);
+  assert.equal(selected.selectedItemId, initial.items[0].id);
+  assert.equal(selected.selectedItem.id, initial.items[0].id);
+  assert.equal(selected.selectedItem.title, "First");
+
+  const changed = await triage.setSelection(initial.items[1].id);
+  assert.equal(changed.selectedItemId, initial.items[1].id);
+  assert.equal(changed.selectedItem.id, initial.items[1].id);
+
+  const replaced = await triage.setItems([initial.items[0]]);
+  assert.equal(replaced.selectedItemId, null);
+  assert.equal(replaced.selectedItem, null);
+
+  const server = await triage.startServer();
+  t.after(() => server.close());
+  const selectionResponse = await postJson(server, "/api/selection", { id: initial.items[0].id });
+  assert.equal(selectionResponse.status, 200);
+  const selectionBody = await selectionResponse.json();
+  assert.equal(selectionBody.selectedItemId, initial.items[0].id);
+  assert.equal(selectionBody.selectedItem.id, initial.items[0].id);
+
+  await triage.dismiss(initial.items[0].id);
+  const dismissed = await triage.getItems();
+  assert.equal(dismissed.selectedItemId, null);
+  assert.equal(dismissed.selectedItem, null);
+});
+
 test("Teams dismiss resolves the user and sends the exact WorkIQ action", async (t) => {
   const stateRoot = await mkdtemp(join(tmpdir(), "triage-teams-dismiss-"));
   t.after(() => rm(stateRoot, { recursive: true, force: true }));

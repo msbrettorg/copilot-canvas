@@ -67,6 +67,35 @@ const itemSchema = {
   },
 };
 
+const getItemsOutputSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "items",
+    "updatedAt",
+    "calendarEvents",
+    "agendaUpdatedAt",
+    "agendaLoaded",
+    "selectedItemId",
+    "selectedItem",
+  ],
+  properties: {
+    items: { type: "array", items: itemSchema },
+    updatedAt: { anyOf: [{ type: "string" }, { type: "null" }] },
+    calendarEvents: { type: "array", items: { type: "object" } },
+    agendaUpdatedAt: { anyOf: [{ type: "string" }, { type: "null" }] },
+    agendaLoaded: { type: "boolean" },
+    selectedItemId: {
+      anyOf: [{ type: "string" }, { type: "null" }],
+      description: "ID of the item currently open in the reading pane, or null.",
+    },
+    selectedItem: {
+      anyOf: [itemSchema, { type: "null" }],
+      description: "Snapshot of the item currently open in the reading pane, or null.",
+    },
+  },
+};
+
 session = await joinSession({
   enableMcpApps: true,
   canvases: [
@@ -88,7 +117,8 @@ session = await joinSession({
       actions: [
         {
           name: "get_items",
-          description: "Return the current triage items and the last update time.",
+          description: "Return current triage items, update times, agenda, and the selected reading-pane item.",
+          outputSchema: getItemsOutputSchema,
           handler: wrap(() => triage.getItems()),
         },
         {
