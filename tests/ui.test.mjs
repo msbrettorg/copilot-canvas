@@ -473,7 +473,7 @@ test("filtering out the selected item clears the reading-pane selection", async 
   );
 });
 
-test("selection publication failure restores the server-selected item", async () => {
+test("selection publication failure does not close the reading pane", async () => {
   const app = await loadApp();
   const first = { id: "item-1", source: "email", sender: "Sample Sender", title: "First", status: "action" };
   const second = { id: "item-2", source: "email", sender: "Sample Sender", title: "Second", status: "action" };
@@ -492,7 +492,8 @@ test("selection publication failure restores the server-selected item", async ()
   await app.selectItem(second);
   await new Promise((resolve) => setImmediate(resolve));
 
-  assert.equal(app.state.selectedId(), first.id);
+  assert.equal(app.state.selectedId(), second.id);
+  assert.equal(app.root("itemView").hidden, false);
 });
 
 test("an incoming server snapshot restores the reading pane selection", async () => {

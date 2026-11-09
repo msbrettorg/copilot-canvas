@@ -520,7 +520,6 @@ function toggleItem(item) {
 
 async function selectItem(item, { publish = true } = {}) {
   if (!item || pending.has(item.id)) return;
-  const previousId = selectedId;
   clearTimeout(detailRetryTimer);
   detailRetryTimer = null;
   selectedId = item.id;
@@ -532,16 +531,7 @@ async function selectItem(item, { publish = true } = {}) {
   renderList();
   renderDetailHeader(item);
   showDetailLoading();
-  if (publish) {
-    const published = await publishSelection(item.id);
-    if (seq !== detailSeq || selectedId !== item.id) return;
-    if (!published) {
-      const previous = itemById(previousId);
-      if (previous && visible().some((entry) => entry.id === previous.id)) await selectItem(previous, { publish: false });
-      else backToQueue({ publish: false });
-      return;
-    }
-  }
+  if (publish) void publishSelection(item.id);
   try {
     const result = await post("/api/detail", { id: item.id });
     if (seq !== detailSeq || selectedId !== item.id) return;
@@ -562,8 +552,7 @@ async function publishSelection(id) {
   try {
     await post("/api/selection", { id });
     return true;
-  } catch (error) {
-    setStatus(`Could not update selection: ${error.message}`, true);
+  } catch {
     return false;
   }
 }
@@ -2613,17 +2602,10 @@ function renderIntel() {
 function backToQueue({ publish = true } = {}) {
   clearTimeout(detailRetryTimer);
   detailRetryTimer = null;
-  const previous = itemById(selectedId);
   detailSeq++;
   intelSeq++;
   selectedId = null;
-  if (publish) {
-    void publishSelection(null).then((published) => {
-      if (!published && selectedId === null && previous && visible().some((item) => item.id === previous.id)) {
-        void selectItem(previous, { publish: false });
-      }
-    });
-  }
+  if (publish) void publishSelection(null);
   detail = null;
   intel = null;
   $("detailContent").replaceChildren();
