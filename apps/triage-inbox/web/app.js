@@ -518,7 +518,7 @@ function toggleItem(item) {
   else selectItem(item);
 }
 
-async function selectItem(item, { publish = true } = {}) {
+async function selectItem(item) {
   if (!item || pending.has(item.id)) return;
   clearTimeout(detailRetryTimer);
   detailRetryTimer = null;
@@ -531,7 +531,6 @@ async function selectItem(item, { publish = true } = {}) {
   renderList();
   renderDetailHeader(item);
   showDetailLoading();
-  if (publish) void publishSelection(item.id);
   try {
     const result = await post("/api/detail", { id: item.id });
     if (seq !== detailSeq || selectedId !== item.id) return;
@@ -548,12 +547,11 @@ async function selectItem(item, { publish = true } = {}) {
   }
 }
 
-async function publishSelection(id) {
+async function clearPublishedSelection() {
   try {
-    await post("/api/selection", { id });
-    return true;
+    await post("/api/detail", { clearSelection: true });
   } catch {
-    return false;
+    // Reading-pane navigation remains local if an older extension host is still running.
   }
 }
 
@@ -2605,7 +2603,7 @@ function backToQueue({ publish = true } = {}) {
   detailSeq++;
   intelSeq++;
   selectedId = null;
-  if (publish) void publishSelection(null);
+  if (publish) void clearPublishedSelection();
   detail = null;
   intel = null;
   $("detailContent").replaceChildren();
@@ -2769,7 +2767,7 @@ function setState(state) {
       void selectItem(selected, { publish: false });
     } else {
       backToQueue({ publish: false });
-      if (state.selectedItemId) void publishSelection(null);
+      if (state.selectedItemId) void clearPublishedSelection();
     }
   }
   if (selectedId && (!itemById(selectedId) || !visible().some((item) => item.id === selectedId))) backToQueue();

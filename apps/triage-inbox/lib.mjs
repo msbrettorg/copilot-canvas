@@ -2906,7 +2906,9 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
             : [],
           agendaUpdatedAt: parsed.agendaUpdatedAt ?? null,
           agendaLoaded: Boolean(parsed.agendaLoaded),
+          selectedItemId: typeof parsed.selectedItemId === "string" ? parsed.selectedItemId : null,
         };
+        selectedItemId = state.selectedItemId;
         if (!state.agendaLoaded && state.calendarEvents.length && state.calendarEvents.every((event) => String(event.id).startsWith("seed-"))) {
           state.calendarEvents = annotateConflicts(buildSeedEvents());
         }
@@ -2925,6 +2927,7 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
           calendarEvents: annotateConflicts(buildSeedEvents()),
           agendaUpdatedAt: null,
           agendaLoaded: false,
+          selectedItemId: null,
         };
         await save();
       } finally {
@@ -2939,6 +2942,7 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
     if (selectedItemId && !state.items.some((item) => item.id === selectedItemId)) {
       selectedItemId = null;
     }
+    state.selectedItemId = selectedItemId;
   }
 
   const snapshot = () => {
@@ -2963,15 +2967,15 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
   }
 
   async function setSelection(id) {
-    return mutate(async () => {
-      await load();
-      if (id !== null && !state.items.some((item) => item.id === id)) {
-        throw new TriageError("not_found", `No item with id ${id}`);
-      }
-      selectedItemId = id;
-      broadcast("state", snapshot());
-      return snapshot();
-    });
+    await load();
+    if (id !== null && !state.items.some((item) => item.id === id)) {
+      throw new TriageError("not_found", `No item with id ${id}`);
+    }
+    selectedItemId = id;
+    state.selectedItemId = id;
+    await save({ touch: false });
+    broadcast("state", snapshot());
+    return snapshot();
   }
 
   const person = (recipient) => {
@@ -3530,6 +3534,7 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
   }
 
   async function getDetail(id, { forceRefresh = false } = {}) {
+    await setSelection(id);
     return mutate(async () => {
       await load();
       const item = state.items.find((entry) => entry.id === id);
@@ -4821,11 +4826,10 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
         sendJson(res, 400, { error: "Unsupported bridge method" });
         return;
       }
-      if (url.pathname === "/api/detail") return sendJson(res, 200, await getDetail(String(body.id), { forceRefresh: body.forceRefresh === true }));
-      if (url.pathname === "/api/selection") {
-        const id = body.id == null ? null : String(body.id);
-        return sendJson(res, 200, await setSelection(id));
+      if (url.pathname === "/api/detail" && body.clearSelection === true && body.id == null) {
+        return sendJson(res, 200, await mutate(() => setSelection(null)));
       }
+      if (url.pathname === "/api/detail") return sendJson(res, 200, await getDetail(String(body.id), { forceRefresh: body.forceRefresh === true }));
       if (url.pathname === "/api/refresh") return sendJson(res, 200, await refresh());
       if (url.pathname === "/api/agenda") return sendJson(res, 200, await refreshAgenda());
       if (url.pathname === "/api/intel") return sendJson(res, 200, await getItemIntel(body));
@@ -4928,7 +4932,6 @@ export function createTriage({ workiq = unavailableWorkIq(), statePath = STATE_P
 
   return {
     getItems,
-    setSelection,
     setItems,
     refresh,
     fetchAgenda,

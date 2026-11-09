@@ -442,7 +442,7 @@ test("selecting an item reads local intel only, and X-Ray fetches the directory 
   assert.equal(after.length, 2);
   assert.equal(after[1].body.localOnly, false);
   assert.deepEqual(
-    calls.filter((call) => call.path === "/api/selection").map((call) => call.body.id),
+    calls.filter((call) => call.path === "/api/detail").map((call) => call.body.id),
     ["item-1"],
   );
 });
@@ -468,20 +468,20 @@ test("filtering out the selected item clears the reading-pane selection", async 
 
   assert.equal(app.state.selectedId(), null);
   assert.deepEqual(
-    calls.filter((call) => call.path === "/api/selection").map((call) => call.body.id),
+    calls.filter((call) => call.path === "/api/detail").map((call) => call.body.id ?? null),
     [selected.id, null],
   );
 });
 
-test("selection publication failure does not close the reading pane", async () => {
+test("detail publication failure does not close the reading pane", async () => {
   const app = await loadApp();
   const first = { id: "item-1", source: "email", sender: "Sample Sender", title: "First", status: "action" };
   const second = { id: "item-2", source: "email", sender: "Sample Sender", title: "Second", status: "action" };
   app.state.setItems([first, second]);
   app.state.stubChrome();
   app.state.setPost(async (path, body) => {
-    if (path === "/api/selection" && body.id === second.id) throw new Error("selection failed");
     if (path === "/api/detail") {
+      if (body.id === second.id) throw new Error("detail failed");
       const item = body.id === first.id ? first : second;
       return { id: item.id, source: item.source, item, blocks: [], attachments: [] };
     }

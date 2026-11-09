@@ -740,18 +740,20 @@ test("selection snapshots follow selection changes and reset when the selected i
     statePath,
   });
   const initial = await triage.setItems([
-    { source: "email", messageId: "message-1", title: "First", status: "action" },
-    { source: "email", messageId: "message-2", title: "Second", status: "action" },
+    { source: "email", rawId: "seed-email-mention", messageId: "message-1", title: "First", status: "action" },
+    { source: "email", rawId: "seed-email-direct", messageId: "message-2", title: "Second", status: "action" },
   ]);
   assert.equal(initial.selectedItemId, null);
   assert.equal(initial.selectedItem, null);
 
-  const selected = await triage.setSelection(initial.items[0].id);
+  await triage.getDetail(initial.items[0].id);
+  const selected = await triage.getItems();
   assert.equal(selected.selectedItemId, initial.items[0].id);
   assert.equal(selected.selectedItem.id, initial.items[0].id);
   assert.equal(selected.selectedItem.title, "First");
 
-  const changed = await triage.setSelection(initial.items[1].id);
+  await triage.getDetail(initial.items[1].id);
+  const changed = await triage.getItems();
   assert.equal(changed.selectedItemId, initial.items[1].id);
   assert.equal(changed.selectedItem.id, initial.items[1].id);
 
@@ -761,11 +763,25 @@ test("selection snapshots follow selection changes and reset when the selected i
 
   const server = await triage.startServer();
   t.after(() => server.close());
-  const selectionResponse = await postJson(server, "/api/selection", { id: initial.items[0].id });
+  const selectionResponse = await postJson(server, "/api/detail", { id: initial.items[0].id });
   assert.equal(selectionResponse.status, 200);
-  const selectionBody = await selectionResponse.json();
+  await selectionResponse.json();
+  const selectionBody = await (await fetch(new URL("/api/state", server.url))).json();
   assert.equal(selectionBody.selectedItemId, initial.items[0].id);
   assert.equal(selectionBody.selectedItem.id, initial.items[0].id);
+
+  const clearResponse = await postJson(server, "/api/detail", { clearSelection: true });
+  assert.equal(clearResponse.status, 200);
+  const cleared = await clearResponse.json();
+  assert.equal(cleared.selectedItemId, null);
+  assert.equal(cleared.selectedItem, null);
+
+  await triage.getDetail(initial.items[0].id);
+  const persisted = JSON.parse(await readFile(statePath, "utf8"));
+  assert.equal(persisted.selectedItemId, initial.items[0].id);
+  const reloaded = await createTriage({ statePath }).getItems();
+  assert.equal(reloaded.selectedItemId, initial.items[0].id);
+  assert.equal(reloaded.selectedItem.id, initial.items[0].id);
 
   await triage.dismiss(initial.items[0].id);
   const dismissed = await triage.getItems();
