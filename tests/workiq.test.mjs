@@ -1981,6 +1981,8 @@ test("web UI wires the resizer and the Open, Delete, Done row actions", async ()
   const { readFile } = await import("node:fs/promises");
   const html = await readFile(new URL("../apps/triage-inbox/web/index.html", import.meta.url), "utf8");
   const js = await readFile(new URL("../apps/triage-inbox/web/app.js", import.meta.url), "utf8");
+  assert.match(html, /\.detail-header > \.detail-actions \{[^}]*min-width: 0;/);
+  assert.match(html, /\.detail-header \.detail-actions \.detail-actions \{[^}]*flex-wrap: wrap;/);
   assert.match(html, /id="paneResizer"/);
   assert.match(html, /--feed-width: 760px/);
   assert.match(html, /aria-valuenow="760"/);
